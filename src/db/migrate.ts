@@ -13,6 +13,9 @@ const MIGRATION_LOCK_ID = 776_1420;
 /** How many future weekly partitions to provision ahead of the current week. */
 const WEEKS_AHEAD = 4;
 
+/** Fallback when RETENTION_DAYS is unset; mirrors the migration's seed value. */
+const DEFAULT_RETENTION_DAYS = 30;
+
 async function appliedMigrations(pool: Pool): Promise<Set<string>> {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -62,6 +65,7 @@ export async function runMigrations(pool: Pool, log: (msg: string) => void): Pro
     }
 
     await ensurePartitions(pool, log);
+    await syncRetentionConfig(pool, log);
   } finally {
     await pool.query('SELECT pg_advisory_unlock($1)', [MIGRATION_LOCK_ID]);
   }
@@ -83,4 +87,28 @@ export async function ensurePartitions(pool: Pool, log: (msg: string) => void): 
     created.push(rows[0].ensure_logs_partition);
   }
   log(`partitions ready: ${created.join(', ')}`);
+}
+
+/**
+ * Writes RETENTION_DAYS into retention_config so the pg_cron job picks it up.
+ * Runs on every boot, so restarting with a changed env var changes the active
+ * retention window without a code change or a re-scheduled job.
+ */
+export async function syncRetentionConfig(pool: Pool, log: (msg: string) => void): Promise<void> {
+  const raw = process.env.RETENTION_DAYS ?? String(DEFAULT_RETENTION_DAYS);
+  const days = Number(raw);
+
+  if (!Number.isInteger(days) || days <= 0) {
+    throw new Error(`RETENTION_DAYS must be a positive integer, got "${raw}"`);
+  }
+
+  await pool.query(
+    `INSERT INTO retention_config (id, retention_days, updated_at)
+     VALUES (TRUE, $1, now())
+     ON CONFLICT (id) DO UPDATE
+       SET retention_days = EXCLUDED.retention_days,
+           updated_at     = now()`,
+    [days]
+  );
+  log(`retention window set to ${days} day(s)`);
 }

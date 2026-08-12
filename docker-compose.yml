@@ -1,6 +1,9 @@
 services:
   postgres:
-    image: postgres:16-alpine
+    build:
+      context: ./docker/postgres
+      args:
+        POSTGRES_DB: logs
     environment:
       POSTGRES_USER: loguser
       POSTGRES_PASSWORD: logpass
@@ -28,7 +31,7 @@ services:
     environment:
       DATABASE_URL: postgres://loguser:logpass@postgres:5432/logs
       PORT: 8080
-      RETENTION_DAYS: 30
+      RETENTION_DAYS: ${RETENTION_DAYS:-30}
       AUTH_ENABLED: "false"
     ports:
       - "8080:8080"

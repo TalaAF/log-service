@@ -3,6 +3,7 @@ import { pool } from './db/client.js';
 import { runMigrations } from './db/migrate.js';
 import { registerHealthRoute } from './routes/health.js';
 import { registerLogsRoute } from './routes/logs.js';
+import { registerAggregateRoute } from './routes/aggregate.js';
 
 const app = Fastify({ logger: true });
 
@@ -10,6 +11,7 @@ let dbReady = false;
 
 registerHealthRoute(app, () => dbReady);
 registerLogsRoute(app);
+registerAggregateRoute(app);
 
 /** Waits for Postgres to accept connections; compose's healthcheck can pass a beat early. */
 async function waitForDatabase(attempts = 15, delayMs = 1000): Promise<void> {

@@ -62,3 +62,27 @@ function validAttributes(attributes: unknown): {valid: true, attributes: Record<
     }
     return { valid: true, attributes: attr };
 }
+
+export interface RejectedEntry {
+  index: number;
+  reason: string;
+}
+
+export function processLogBatch(rawLogs: unknown[]): {
+  accepted: NewLogEntry[];
+  rejected: RejectedEntry[];
+} {
+  const accepted: NewLogEntry[] = [];
+  const rejected: RejectedEntry[] = [];
+
+  rawLogs.forEach((log, index) => {
+    const result = validateLogEntry(log);
+    if (result.valid) {
+      accepted.push(result.newLogEntry);
+    } else {
+      rejected.push({ index, reason: result.reason });
+    }
+  });
+
+  return { accepted, rejected };
+}

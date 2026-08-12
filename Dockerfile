@@ -19,8 +19,10 @@ COPY package*.json ./
 RUN npm ci --omit=dev
 
 COPY --from=builder /app/dist ./dist
-COPY migrations ./migrations
-COPY drizzle.config.ts ./
+
+# tsc only emits .ts -> .js, so the .sql migrations have to be copied in
+# separately, next to the compiled migrate.js that resolves them.
+COPY src/db/migrations ./dist/src/db/migrations
 
 EXPOSE 8080
 

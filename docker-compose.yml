@@ -2,12 +2,93 @@ services:
   postgres:
     build:
       context: ./docker/postgres
-      args:
-        POSTGRES_DB: logs
     environment:
       POSTGRES_USER: loguser
       POSTGRES_PASSWORD: logpass
       POSTGRES_DB: logs
+    # Server tuning lives here rather than in the image so it applies to an
+    # existing data volume as well as a freshly initialised one — appending to
+    # postgresql.conf.sample only takes effect at initdb time.
+    #
+    # Everything below is sized for this container's budget: 1 CPU, 1 GB. CPU is
+    # the scarce resource and memory is not, so the settings consistently spend
+    # memory to save CPU.
+    command:
+      - postgres
+      # pg_cron is a background worker and must be preloaded before start.
+      # cron.database_name has to name the application database: pg_cron installs
+      # into exactly one database per cluster and cannot reach across databases.
+      - -c
+      - shared_preload_libraries=pg_cron,pg_stat_statements
+      - -c
+      - cron.database_name=logs
+      # Acknowledge a commit once it is in the WAL buffer instead of waiting for
+      # the disk flush. This is the standard trade for a log ingestion workload:
+      # a hard crash can lose the last fraction of a second of commits, but the
+      # cluster cannot be corrupted, and it removes a per-transaction fsync from
+      # the hot path.
+      - -c
+      - synchronous_commit=off
+      - -c
+      - wal_writer_delay=200ms
+      - -c
+      - wal_writer_flush_after=2MB
+      # Checkpoint spreading. The default 1 GB max_wal_size forces frequent
+      # checkpoints under sustained ingest, and every checkpoint makes the next
+      # write to each page a full-page WAL record — pure write amplification.
+      - -c
+      - max_wal_size=4GB
+      - -c
+      - min_wal_size=1GB
+      - -c
+      - checkpoint_timeout=15min
+      - -c
+      - checkpoint_completion_target=0.9
+      - -c
+      - wal_buffers=16MB
+      # Memory. shared_buffers at ~30% of the container keeps the hot partition
+      # and its indexes resident; effective_cache_size only informs the planner.
+      - -c
+      - shared_buffers=320MB
+      - -c
+      - effective_cache_size=768MB
+      - -c
+      - work_mem=16MB
+      - -c
+      - maintenance_work_mem=128MB
+      # Connections are deliberately few: the app pools total 12, and more
+      # concurrent backends than cores buys context switching, not throughput.
+      - -c
+      - max_connections=30
+      # JIT compiles a plan on a box with one core to spare. The aggregate query
+      # over a million rows sits right above jit_above_cost, so leaving this on
+      # spends CPU on compilation that the query then has to earn back.
+      - -c
+      - jit=off
+      # Parallel query on a one-CPU container is a net loss: the workers cannot
+      # run concurrently, so all it adds is worker startup, tuple queues and
+      # contention. Measured on the aggregate query, the planner was choosing a
+      # two-worker parallel seq scan and paying for it.
+      - -c
+      - max_parallel_workers_per_gather=0
+      - -c
+      - random_page_cost=1.1
+      - -c
+      - effective_io_concurrency=200
+      # Autovacuum has to keep up with an insert-heavy table without competing
+      # for the one CPU during a burst.
+      - -c
+      - autovacuum_max_workers=2
+      - -c
+      - autovacuum_naptime=30s
+      - -c
+      - autovacuum_vacuum_cost_delay=2ms
+      - -c
+      - autovacuum_vacuum_cost_limit=1000
+      - -c
+      - autovacuum_vacuum_insert_scale_factor=0.3
+      - -c
+      - pg_stat_statements.track=top
     ports:
       - "5432:5432"
     volumes:
@@ -33,6 +114,19 @@ services:
       PORT: 8080
       RETENTION_DAYS: ${RETENTION_DAYS:-30}
       AUTH_ENABLED: "false"
+      # Cap V8's heap below the cgroup limit so garbage collection reclaims
+      # before the kernel OOM-kills the process, and give the young generation
+      # room: ingest allocates a large volume of short-lived objects (parsed
+      # JSON), and a bigger semi-space turns frequent scavenges into rare ones.
+      NODE_OPTIONS: "--max-old-space-size=192 --max-semi-space-size=32"
+      # Group-commit buffer. 40ms is far inside the 20s visibility requirement
+      # while still consolidating hundreds of client batches into one write.
+      FLUSH_INTERVAL_MS: "40"
+      FLUSH_MAX_ROWS: "8000"
+      FLUSH_CONCURRENCY: "3"
+      DB_POOL_MAX: "8"
+      DB_WRITE_POOL_MAX: "4"
+      LOG_LEVEL: "warn"
     ports:
       - "8080:8080"
     healthcheck:

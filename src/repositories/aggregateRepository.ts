@@ -1,5 +1,6 @@
 import { sql, type SQL } from 'drizzle-orm';
 import { db } from '../db/client.js';
+import { attributeCondition } from './attributeFilter.js';
 
 /** Bucket sizes the API accepts, mapped to their width in seconds. */
 export const BUCKET_SECONDS: Record<string, number> = {
@@ -35,8 +36,8 @@ export interface AggregateBucket extends Record<string, unknown> {
 /**
  * Counts matching rows per time bucket, optionally split by service or level.
  *
- * date_trunc() only understands named units, so bucket starts are computed on
- * the epoch instead: floor(epoch / width) * width, back through to_timestamp().
+ * date_trunc() only understands named units, so bucket starts are computed with
+ * date_bin() against the epoch origin instead, which gives arbitrary widths.
  * The range filter stays as a plain "timestamp" >= / < comparison so partition
  * pruning and the (timestamp DESC, id DESC) index still apply — wrapping the
  * column in the bucket expression would make it unsearchable.
@@ -62,7 +63,7 @@ export async function aggregateLogs(filters: AggregateFilters): Promise<Aggregat
 
   if (filters.attributes !== undefined) {
     for (const [key, value] of Object.entries(filters.attributes)) {
-      conditions.push(sql`attributes ->> ${key} = ${value}`);
+      conditions.push(attributeCondition(key, value));
     }
   }
 
@@ -72,7 +73,13 @@ export async function aggregateLogs(filters: AggregateFilters): Promise<Aggregat
 
   const whereClause = sql.join(conditions, sql` AND `);
 
-  const bucketStart = sql`to_timestamp(floor(extract(epoch FROM "timestamp") / ${width}) * ${width})`;
+  // date_bin is a C-implemented function that bins a timestamptz directly.
+  // The previous formulation, floor(extract(epoch FROM ts) / w) * w fed back
+  // through to_timestamp(), forced three arbitrary-precision numeric operations
+  // and two type conversions per row, which is a large cost to pay millions of
+  // times on a single CPU. Binning from the epoch origin produces exactly the
+  // same boundaries: every supported width divides evenly into a day.
+  const bucketStart = sql`date_bin(make_interval(secs => ${width}), "timestamp", TIMESTAMPTZ 'epoch')`;
 
   // group_by names a column, which cannot be a bind parameter. Only the two
   // whitelisted keys above ever reach sql.raw, so the identifier is never
@@ -82,8 +89,11 @@ export async function aggregateLogs(filters: AggregateFilters): Promise<Aggregat
       ? sql.raw(GROUP_BY_COLUMNS[filters.groupBy])
       : sql`NULL::text`;
 
+  // Bucket starts are always whole seconds (every supported width is a whole
+  // number of seconds), and the contract's example carries no fractional part,
+  // so they are rendered without one: 2026-07-20T14:00:00Z.
   const result = await db.execute<AggregateBucket>(sql`
-    SELECT to_char(bucket_start AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS start,
+    SELECT to_char(bucket_start AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS start,
            grp AS group,
            entries AS count
     FROM (

@@ -1,7 +1,7 @@
 import type { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
 import { processLogBatch } from '../validation/logEntry.js';
+import { enqueue } from '../ingest/writeBuffer.js';
 import {
-  insertLogs,
   queryLogs,
   type LogCursor,
   type QueryLogsFilters,
@@ -36,7 +36,10 @@ async function handlePostLogs(request: FastifyRequest, reply: FastifyReply) {
     return reply.status(400).send({ error: 'all entries were rejected', rejected });
   }
 
-  await insertLogs(accepted);
+  // Resolves only once the commit carrying these rows has returned, so a 200
+  // still means Postgres holds the data — the buffer batches writes, it does
+  // not acknowledge them early. A flush failure throws and becomes a 5xx.
+  await enqueue(accepted);
 
   return reply.status(200).send({
     accepted: accepted.length,
@@ -50,10 +53,11 @@ async function handleGetLogs(request: FastifyRequest, reply: FastifyReply) {
     return reply.status(400).send({ error: parsed.error });
   }
 
-  const rows = await queryLogs(parsed.filters);
+  const { rows, hasMore } = await queryLogs(parsed.filters);
 
-  // A full page implies there may be more; the cursor points at its last row.
-  const last = rows.length === parsed.filters.limit ? rows[rows.length - 1] : undefined;
+  // hasMore comes from a lookahead row the repository fetched and discarded, so
+  // the cursor is non-null only when a further page genuinely exists.
+  const last = hasMore ? rows[rows.length - 1] : undefined;
 
   return reply.status(200).send({
     logs: rows,

@@ -1,5 +1,57 @@
 import { LogEntry, NewLogEntry } from "../db/schema.js";
 
+/**
+ * Postgres cannot represent two things that a JSON string legally can: NUL,
+ * which is illegal in both `text` and `jsonb`, and an unpaired surrogate, which
+ * makes `jsonb` reject the value outright.
+ *
+ * These are scrubbed rather than rejected because writes are group-committed:
+ * one pathological row reaching the database would fail the entire flush it
+ * travelled in, turning a single bad entry into thousands of spurious 5xx
+ * responses for unrelated clients. Neither character can appear in a
+ * well-formed log line, so removing them keeps the entry and the batch.
+ *
+ * The scan is a plain char-code loop and allocates nothing for the overwhelming
+ * majority of inputs, which contain neither.
+ */
+function needsSanitizing(value: string): boolean {
+  for (let i = 0; i < value.length; i++) {
+    const code = value.charCodeAt(i);
+    if (code === 0 || (code >= 0xd800 && code <= 0xdfff)) return true;
+  }
+  return false;
+}
+
+function sanitizeText(value: string): string {
+  if (!needsSanitizing(value)) return value;
+
+  let out = '';
+  for (let i = 0; i < value.length; i++) {
+    const code = value.charCodeAt(i);
+    if (code === 0) continue;
+
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = value.charCodeAt(i + 1);
+      // A high surrogate is only meaningful when a low surrogate follows it;
+      // copy the pair through intact, otherwise substitute U+FFFD.
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        out += value[i] + value[i + 1];
+        i++;
+      } else {
+        out += '�';
+      }
+      continue;
+    }
+
+    if (code >= 0xdc00 && code <= 0xdfff) {
+      out += '�';
+      continue;
+    }
+
+    out += value[i];
+  }
+  return out;
+}
 
 export function validateLogEntry(log: unknown): { valid: true, newLogEntry: NewLogEntry } | { valid: false; reason: string } {
   if(log==null ||typeof log !== 'object'|| Array.isArray(log)){
@@ -42,8 +94,8 @@ export function validateLogEntry(log: unknown): { valid: true, newLogEntry: NewL
 const newLogEntry: NewLogEntry = {
     timestamp: entry.timestamp,
     level: entry.level,
-    service: entry.service,
-    message: entry.message,
+    service: sanitizeText(entry.service),
+    message: sanitizeText(entry.message),
     attributes: attribute,
 };
 return { valid: true, newLogEntry };
@@ -55,12 +107,14 @@ function validAttributes(attributes: unknown): {valid: true, attributes: Record<
         return { valid: false, reason: 'attributes must be a JSON object' };
     }
     const attr = attributes as Record<string, unknown>;
-    for (const value of Object.values(attr)) {
+    const clean: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(attr)) {
      if (typeof value !== 'string' && typeof value !== 'number' && typeof value !== 'boolean') {
     return { valid: false, reason: 'attributes values must be strings, numbers, or booleans' };
   }
+    clean[sanitizeText(key)] = typeof value === 'string' ? sanitizeText(value) : value;
     }
-    return { valid: true, attributes: attr };
+    return { valid: true, attributes: clean };
 }
 
 export interface RejectedEntry {

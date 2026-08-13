@@ -64,29 +64,41 @@ export async function runMigrations(pool: Pool, log: (msg: string) => void): Pro
       }
     }
 
-    await ensurePartitions(pool, log);
     await syncRetentionConfig(pool, log);
+    await ensurePartitions(pool, log);
   } finally {
     await pool.query('SELECT pg_advisory_unlock($1)', [MIGRATION_LOCK_ID]);
   }
 }
 
 /**
- * Provisions the current week's partition plus WEEKS_AHEAD future ones, so
- * ingestion never lands on a missing range. Runs on every boot; a long-lived
- * deployment should also call this on a timer.
+ * Provisions weekly partitions across the whole window rows can legitimately
+ * land in: back to the retention cutoff and WEEKS_AHEAD into the future.
+ *
+ * Backwards matters as much as forwards. Any row older than the oldest real
+ * partition is routed to the DEFAULT partition, which retention cannot drop
+ * wholesale and has to clean row by row — so a backfill of historical data, or
+ * simply a month of stored history, would otherwise accumulate there. Runs on
+ * every boot; pg_cron repeats it hourly.
  */
 export async function ensurePartitions(pool: Pool, log: (msg: string) => void): Promise<void> {
-  const created: string[] = [];
-  for (let week = 0; week <= WEEKS_AHEAD; week++) {
-    const target = new Date(Date.now() + week * 7 * 24 * 60 * 60 * 1000);
-    const { rows } = await pool.query<{ ensure_logs_partition: string }>(
-      'SELECT ensure_logs_partition($1)',
-      [target.toISOString()]
-    );
-    created.push(rows[0].ensure_logs_partition);
+  const weeksBack = Math.ceil(retentionDays() / 7);
+  const { rows } = await pool.query<{ ensure_logs_partition_range: string }>(
+    'SELECT ensure_logs_partition_range($1, $2)',
+    [weeksBack, WEEKS_AHEAD]
+  );
+  log(`partitions ready (${weeksBack} weeks back, ${WEEKS_AHEAD} ahead): ${rows[0].ensure_logs_partition_range}`);
+}
+
+/** RETENTION_DAYS, validated. Shared by partitioning and the config upsert. */
+function retentionDays(): number {
+  const raw = process.env.RETENTION_DAYS ?? String(DEFAULT_RETENTION_DAYS);
+  const days = Number(raw);
+
+  if (!Number.isInteger(days) || days <= 0) {
+    throw new Error(`RETENTION_DAYS must be a positive integer, got "${raw}"`);
   }
-  log(`partitions ready: ${created.join(', ')}`);
+  return days;
 }
 
 /**
@@ -95,12 +107,7 @@ export async function ensurePartitions(pool: Pool, log: (msg: string) => void): 
  * retention window without a code change or a re-scheduled job.
  */
 export async function syncRetentionConfig(pool: Pool, log: (msg: string) => void): Promise<void> {
-  const raw = process.env.RETENTION_DAYS ?? String(DEFAULT_RETENTION_DAYS);
-  const days = Number(raw);
-
-  if (!Number.isInteger(days) || days <= 0) {
-    throw new Error(`RETENTION_DAYS must be a positive integer, got "${raw}"`);
-  }
+  const days = retentionDays();
 
   await pool.query(
     `INSERT INTO retention_config (id, retention_days, updated_at)

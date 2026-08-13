@@ -1,7 +1,80 @@
 import { sql } from 'drizzle-orm';
-import { db } from '../db/client.js';
+import { from as copyFrom } from 'pg-copy-streams';
+import { pipeline } from 'node:stream/promises';
+import { Readable } from 'node:stream';
+import { db, writePool } from '../db/client.js';
 import { logs, type NewLogEntry } from '../db/schema.js';
+import { attributeCondition } from './attributeFilter.js';
 
+const COPY_COLUMNS = '"timestamp", level, service, message, attributes';
+const COPY_SQL = `COPY logs (${COPY_COLUMNS}) FROM STDIN`;
+
+/**
+ * COPY's text format reserves the backslash and the three whitespace codes
+ * below; every other byte is passed through untouched. NUL and unpaired
+ * surrogates are already removed during validation, so nothing reaching here
+ * can break the stream.
+ */
+const COPY_ESCAPES: Record<string, string> = {
+  '\\': '\\\\',
+  '\n': '\\n',
+  '\r': '\\r',
+  '\t': '\\t',
+};
+const COPY_SPECIAL = /[\\\n\r\t]/g;
+
+function copyEscape(value: string): string {
+  return value.replace(COPY_SPECIAL, (char) => COPY_ESCAPES[char]);
+}
+
+/**
+ * Writes a batch with COPY FROM STDIN rather than INSERT.
+ *
+ * INSERT ... VALUES costs a parse, a plan and a bind of six parameters per row,
+ * and the query builder emits different SQL text for every distinct batch size,
+ * so Postgres can never reuse a plan. COPY sends one fixed statement followed by
+ * a stream of pre-formatted tuples, which is the cheapest way to get rows in and
+ * matters most on the single CPU the database container is allowed.
+ *
+ * Row data is never interpolated into SQL: the statement is a compile-time
+ * constant and the values travel in COPY's own data stream, so this path has no
+ * injection surface.
+ */
+export async function copyLogs(entries: NewLogEntry[]): Promise<void> {
+  if (entries.length === 0) return;
+
+  const client = await writePool.connect();
+  try {
+    // Built as one string for the whole batch: thousands of small stream writes
+    // cost far more in the app container, which has half a CPU, than a single
+    // large buffer does.
+    const parts: string[] = [];
+    for (const entry of entries) {
+      parts.push(
+        copyEscape(entry.timestamp as string),
+        '\t',
+        copyEscape(entry.level),
+        '\t',
+        copyEscape(entry.service),
+        '\t',
+        copyEscape(entry.message),
+        '\t',
+        copyEscape(JSON.stringify(entry.attributes ?? {})),
+        '\n'
+      );
+    }
+
+    const target = client.query(copyFrom(COPY_SQL));
+    await pipeline(Readable.from([parts.join('')], { objectMode: false }), target);
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Single-batch insert, kept for callers that need a row visible immediately
+ * without going through the group-commit buffer (backfills, tests).
+ */
 export async function insertLogs(entries: NewLogEntry[]): Promise<void> {
   if (entries.length === 0) return;
   await db.insert(logs).values(entries);
@@ -33,6 +106,11 @@ export interface QueriedLog extends Record<string, unknown> {
   attributes: Record<string, unknown>;
 }
 
+export interface LogPage {
+  rows: QueriedLog[];
+  hasMore: boolean;
+}
+
 /**
  * Fetches one page of logs ordered by (timestamp DESC, id DESC).
  *
@@ -40,8 +118,13 @@ export interface QueriedLog extends Record<string, unknown> {
  * template tag, so values are bound as parameters rather than interpolated.
  * Pagination is keyset-based off the composite (timestamp DESC, id DESC)
  * index — no OFFSET, so page cost stays flat however deep the caller walks.
+ *
+ * One row beyond `limit` is fetched and then discarded. That is what makes
+ * `next_cursor` honest: without it, a result that happens to be exactly `limit`
+ * rows long would hand back a cursor leading to an empty page, and the contract
+ * requires a null cursor when no further results exist.
  */
-export async function queryLogs(filters: QueryLogsFilters): Promise<QueriedLog[]> {
+export async function queryLogs(filters: QueryLogsFilters): Promise<LogPage> {
   const conditions = [sql`TRUE`];
 
   if (filters.service !== undefined) {
@@ -62,7 +145,7 @@ export async function queryLogs(filters: QueryLogsFilters): Promise<QueriedLog[]
 
   if (filters.attributes !== undefined) {
     for (const [key, value] of Object.entries(filters.attributes)) {
-      conditions.push(sql`attributes ->> ${key} = ${value}`);
+      conditions.push(attributeCondition(key, value));
     }
   }
 
@@ -96,11 +179,15 @@ export async function queryLogs(filters: QueryLogsFilters): Promise<QueriedLog[]
       FROM logs
       WHERE ${whereClause}
       ORDER BY "timestamp" DESC, id DESC
-      LIMIT ${filters.limit}
+      LIMIT ${filters.limit + 1}
     ) page
   `);
 
-  return result.rows;
+  const hasMore = result.rows.length > filters.limit;
+  return {
+    rows: hasMore ? result.rows.slice(0, filters.limit) : result.rows,
+    hasMore,
+  };
 }
 
 /** Neutralises LIKE wildcards so `q` stays a literal substring match. */

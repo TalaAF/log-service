@@ -1,28 +1,21 @@
-# Postgres with pg_cron, used for retention (see 0002_retention_pg_cron.sql).
+# Postgres with pg_cron, used for retention (see 0002_retention_pg_cron.sql)
+# and for topping up weekly partitions (see 0003_write_path.sql).
 #
-# pg_cron is a background worker, so it must be present in
-# shared_preload_libraries before the server starts — that cannot be done from
-# a compose `environment:` block or by CREATE EXTENSION alone, which is why
-# this image exists rather than using postgres:16-alpine directly.
+# This image exists only to install the extension binary. pg_cron is a
+# background worker, so it must be listed in shared_preload_libraries before the
+# server starts — that setting, along with the rest of the server tuning, is
+# passed on the postgres command line from docker-compose.yml, which has the
+# advantage of applying to an already-initialised data volume as well as to a
+# fresh one. Appending to postgresql.conf.sample, as this image used to do, only
+# takes effect at initdb time.
 #
 # Debian-based rather than Alpine: pg_cron is packaged for PGDG (apt) but has
 # no ready Alpine package, which would otherwise mean compiling from source.
+#
+# pg_stat_statements needs no package: it ships with postgresql-contrib in the
+# official image and only has to be preloaded.
 FROM postgres:16
-
-# Kept in sync with POSTGRES_DB in docker-compose.yml via a build arg, so the
-# scheduler database and the application database cannot silently diverge.
-ARG POSTGRES_DB=logs
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends postgresql-16-cron \
     && rm -rf /var/lib/apt/lists/*
-
-# postgresql.conf.sample is the template initdb copies into PGDATA on first
-# boot, so appending here applies the settings to a freshly initialised volume.
-#
-# cron.database_name must be the application database: pg_cron installs into
-# exactly one database per cluster and cron.schedule() cannot reach across
-# databases. It defaults to "postgres", which would put the scheduler somewhere
-# it cannot see the logs table.
-RUN echo "shared_preload_libraries = 'pg_cron'" >> /usr/share/postgresql/postgresql.conf.sample \
-    && echo "cron.database_name = '${POSTGRES_DB}'" >> /usr/share/postgresql/postgresql.conf.sample

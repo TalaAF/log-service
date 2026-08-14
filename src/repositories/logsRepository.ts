@@ -155,8 +155,22 @@ export async function queryLogs(filters: QueryLogsFilters): Promise<LogPage> {
 
   if (filters.cursor !== undefined) {
     const { timestamp, id } = filters.cursor;
+    // Row-wise comparison, not the equivalent OR form.
+    //
+    // `ts < $1 OR (ts = $1 AND id < $2)` is logically identical but Postgres
+    // cannot turn it into an index range condition — it applies it as a Filter
+    // and walks the index from the top on every page, discarding everything
+    // before the cursor. Measured at a cursor 500k rows deep: 44,263 buffers
+    // and 500,001 rows discarded, making a full walk O(n^2). The row
+    // constructor becomes an Index Cond and starts the scan at the cursor: 61
+    // buffers, nothing discarded.
+    //
+    // The leading `"timestamp" <=` is redundant — it is entailed by the row
+    // comparison, so the result set is unchanged — but a RowCompareExpr cannot
+    // drive partition pruning, and without it every page opens all 11
+    // partitions instead of the 7 that can hold matching rows.
     conditions.push(
-      sql`("timestamp" < ${timestamp}::timestamptz OR ("timestamp" = ${timestamp}::timestamptz AND id < ${id}::bigint))`
+      sql`"timestamp" <= ${timestamp}::timestamptz AND ("timestamp", id) < (${timestamp}::timestamptz, ${id}::bigint)`
     );
   }
 

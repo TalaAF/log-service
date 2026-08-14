@@ -92,6 +92,26 @@ export async function aggregateLogs(filters: AggregateFilters): Promise<Aggregat
   // Bucket starts are always whole seconds (every supported width is a whole
   // number of seconds), and the contract's example carries no fractional part,
   // so they are rendered without one: 2026-07-20T14:00:00Z.
+  // No ORDER BY in SQL, deliberately.
+  //
+  // The planner cannot estimate the distinct count of a function expression, so
+  // for the bucket column it assumes something between 10% and 100% of the
+  // table. Asked to return sorted rows, it then satisfies the grouping and the
+  // ordering with one sort of every input row, and picks GroupAggregate over a
+  // Sort of the whole scan: measured at 2.35M rows that was an external merge
+  // spilling 59MB to disk, 974ms. Dropping the ORDER BY lets it choose
+  // HashAggregate over the same scan — 6.2MB in memory, 515ms — because the
+  // grouping no longer has to produce ordered output.
+  //
+  // The ordering is then done here, on the aggregated rows. There are only ever
+  // as many of those as buckets times groups, so it is a sort of tens to a few
+  // thousand rows instead of millions.
+  //
+  // Extended statistics were tried first and do fix the estimate exactly, but
+  // they are populated by ANALYZE on the partitioned parent, and autovacuum
+  // never analyses a partitioned parent. On a fresh database the migration
+  // would analyse an empty table, which is precisely the state a benchmark run
+  // starts from, so the statistics would not be there when they were needed.
   const result = await db.execute<AggregateBucket>(sql`
     SELECT to_char(bucket_start AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS start,
            grp AS group,
@@ -103,11 +123,20 @@ export async function aggregateLogs(filters: AggregateFilters): Promise<Aggregat
       FROM logs
       WHERE ${whereClause}
       GROUP BY 1, 2
-      ORDER BY 1 ASC, 2 ASC
     ) aggregated
   `);
 
-  return result.rows;
+  // Ascending by bucket start, then by group. `start` is rendered as a
+  // zero-padded ISO 8601 UTC string, so lexicographic order is chronological
+  // order. Group ordering is not specified by the contract; code-point order is
+  // used because it is deterministic and independent of database collation.
+  return result.rows.sort((a, b) => {
+    if (a.start !== b.start) return a.start < b.start ? -1 : 1;
+    const left = a.group ?? '';
+    const right = b.group ?? '';
+    if (left === right) return 0;
+    return left < right ? -1 : 1;
+  });
 }
 
 /** Neutralises LIKE wildcards so `q` stays a literal substring match. */

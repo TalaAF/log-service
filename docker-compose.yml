@@ -119,10 +119,11 @@ services:
       # room: ingest allocates a large volume of short-lived objects (parsed
       # JSON), and a bigger semi-space turns frequent scavenges into rare ones.
       NODE_OPTIONS: "--max-old-space-size=192 --max-semi-space-size=32"
-      # Group-commit buffer. 40ms is far inside the 20s visibility requirement
-      # while still consolidating hundreds of client batches into one write.
-      FLUSH_INTERVAL_MS: "40"
-      FLUSH_MAX_ROWS: "8000"
+      # Group-commit buffer. The flusher is self-clocking — it writes as soon as
+      # a slot frees — so there is no interval to tune. FLUSH_INTERVAL_MS is only
+      # a safety net for stranded rows, and FLUSH_MAX_ROWS caps a single COPY.
+      FLUSH_INTERVAL_MS: "${FLUSH_INTERVAL_MS:-50}"
+      FLUSH_MAX_ROWS: "20000"
       FLUSH_CONCURRENCY: "3"
       DB_POOL_MAX: "8"
       DB_WRITE_POOL_MAX: "4"

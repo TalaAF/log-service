@@ -5,6 +5,7 @@ import { drain } from './ingest/writeBuffer.js';
 import { registerHealthRoute } from './routes/health.js';
 import { registerLogsRoute } from './routes/logs.js';
 import { registerAggregateRoute } from './routes/aggregate.js';
+import { registerStatsRoute } from './routes/stats.js';
 
 /**
  * Request logging is off by default, via the log level rather than a flag.
@@ -33,6 +34,7 @@ let dbReady = false;
 registerHealthRoute(app, () => dbReady);
 registerLogsRoute(app);
 registerAggregateRoute(app);
+registerStatsRoute(app);
 
 /** Waits for Postgres to accept connections; compose's healthcheck can pass a beat early. */
 async function waitForDatabase(attempts = 15, delayMs = 1000): Promise<void> {

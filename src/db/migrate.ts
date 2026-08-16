@@ -65,10 +65,65 @@ export async function runMigrations(pool: Pool, log: (msg: string) => void): Pro
     }
 
     await syncRetentionConfig(pool, log);
+    await syncRollupConfig(pool, log);
     await ensurePartitions(pool, log);
   } finally {
     await pool.query('SELECT pg_advisory_unlock($1)', [MIGRATION_LOCK_ID]);
   }
+}
+
+/**
+ * Writes the rollup knobs into rollup_config so the pg_cron refresh picks them
+ * up, on the same every-boot basis as retention.
+ *
+ * ROLLUP_LAG_SECONDS is the one worth thinking about. It is how far behind
+ * now() the rollup/raw boundary is allowed to sit, and it is the difference
+ * between an aggregate reading a minute of raw rows and reading two.
+ *
+ * It used to have to cover the delay between a client stamping a log and
+ * Postgres committing it, which meant guessing generously. It no longer does:
+ * the ingest floor (src/ingest/ingestFloor.ts) covers that case exactly, by
+ * pulling the boundary below anything this process has recently accepted
+ * whatever its timestamp. What is left for the lag to absorb is clock skew
+ * between the client and the database, so 10 seconds is ample.
+ *
+ * The measurement behind caring: at 15,000 logs/s a 90-second hot tail is
+ * 1.2M raw rows, 34,715 buffer reads and 1.6s of Postgres time per aggregate.
+ * The tail does not grow with the table — that is the point of the rollup — but
+ * the constant is worth keeping small.
+ *
+ * ROLLUP_RETENTION_DAYS defaults to RETENTION_DAYS. Rollup rows are small
+ * enough to keep for much longer, but doing so by default would let aggregates
+ * report counts for logs that retention has already deleted, which is a change
+ * in what the endpoint means rather than a tuning decision.
+ */
+export async function syncRollupConfig(pool: Pool, log: (msg: string) => void): Promise<void> {
+  const lagSeconds = positiveIntFromEnv('ROLLUP_LAG_SECONDS', 10, true);
+  const maxFoldRows = positiveIntFromEnv('ROLLUP_MAX_FOLD_ROWS', 1_000_000, false);
+  const rollupDays = positiveIntFromEnv('ROLLUP_RETENTION_DAYS', retentionDays(), false);
+
+  await pool.query(
+    `INSERT INTO rollup_config (id, lag_seconds, max_fold_rows, retention_days)
+     VALUES (TRUE, $1, $2, $3)
+     ON CONFLICT (id) DO UPDATE
+       SET lag_seconds    = EXCLUDED.lag_seconds,
+           max_fold_rows  = EXCLUDED.max_fold_rows,
+           retention_days = EXCLUDED.retention_days`,
+    [lagSeconds, maxFoldRows, rollupDays]
+  );
+  log(`rollups: lag ${lagSeconds}s, retention ${rollupDays} day(s), fold cap ${maxFoldRows} rows`);
+}
+
+/** Reads a positive integer setting, or zero-or-more when `allowZero`. */
+function positiveIntFromEnv(name: string, fallback: number, allowZero: boolean): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw === '') return fallback;
+
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < (allowZero ? 0 : 1)) {
+    throw new Error(`${name} must be a ${allowZero ? 'non-negative' : 'positive'} integer, got "${raw}"`);
+  }
+  return value;
 }
 
 /**

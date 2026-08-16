@@ -54,10 +54,11 @@ END $$;
 -- ------------------------------------------------------------------- config
 CREATE TABLE IF NOT EXISTS rollup_config (
     id              BOOLEAN PRIMARY KEY DEFAULT TRUE,
-    -- How far behind now() the rollup/raw boundary is allowed to sit. It has to
-    -- cover the delay between a client stamping a log and Postgres committing
-    -- it, plus any clock skew between the two. See safe_before below.
-    lag_seconds     INTEGER NOT NULL DEFAULT 30,
+    -- How far behind now() the rollup/raw boundary is allowed to sit. This now
+    -- covers only clock skew between the client and the database: the delay
+    -- between stamping a log and committing it is handled exactly, and without
+    -- guesswork, by the ingest floor in the application. See safe_before below.
+    lag_seconds     INTEGER NOT NULL DEFAULT 10,
     -- Largest number of ids one refresh will fold. Bounds the cost of a single
     -- run when the watermark is a long way behind -- first deployment onto a
     -- populated database, or a restart after downtime -- so the backlog is

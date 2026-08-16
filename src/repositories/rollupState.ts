@@ -43,7 +43,7 @@ const STATE_TTL_MS = Number(process.env.ROLLUP_STATE_TTL_MS) || 1000;
 let cached: CachedState | null = null;
 let inFlight: Promise<RollupState> | null = null;
 
-interface StateRow {
+interface StateRow extends Record<string, unknown> {
   safe_before: Date | string | null;
   watermark_id: string;
   last_refresh_at: Date | string | null;

@@ -53,7 +53,7 @@ function sanitizeText(value: string): string {
   return out;
 }
 
-export function validateLogEntry(log: unknown): { valid: true, newLogEntry: NewLogEntry } | { valid: false; reason: string } {
+export function validateLogEntry(log: unknown): { valid: true, newLogEntry: NewLogEntry, timestampMs: number } | { valid: false; reason: string } {
   if(log==null ||typeof log !== 'object'|| Array.isArray(log)){
     return {valid: false, reason: "log entry must be a JSON object"};
   } 
@@ -98,7 +98,7 @@ const newLogEntry: NewLogEntry = {
     message: sanitizeText(entry.message),
     attributes: attribute,
 };
-return { valid: true, newLogEntry };
+return { valid: true, newLogEntry, timestampMs: logTime };
 }
 
 
@@ -125,18 +125,25 @@ export interface RejectedEntry {
 export function processLogBatch(rawLogs: unknown[]): {
   accepted: NewLogEntry[];
   rejected: RejectedEntry[];
+  /** Oldest accepted timestamp, or Infinity when nothing was accepted. */
+  oldestAcceptedMs: number;
 } {
   const accepted: NewLogEntry[] = [];
   const rejected: RejectedEntry[] = [];
+  // Tracked here rather than re-derived later: validation has already parsed
+  // every timestamp, so the aggregate boundary gets what it needs for the cost
+  // of a comparison instead of a second pass of Date parsing on the hot path.
+  let oldestAcceptedMs = Infinity;
 
   rawLogs.forEach((log, index) => {
     const result = validateLogEntry(log);
     if (result.valid) {
       accepted.push(result.newLogEntry);
+      if (result.timestampMs < oldestAcceptedMs) oldestAcceptedMs = result.timestampMs;
     } else {
       rejected.push({ index, reason: result.reason });
     }
   });
 
-  return { accepted, rejected };
+  return { accepted, rejected, oldestAcceptedMs };
 }

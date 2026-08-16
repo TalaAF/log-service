@@ -1,11 +1,13 @@
 import type { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
 import { processLogBatch } from '../validation/logEntry.js';
 import { enqueue } from '../ingest/writeBuffer.js';
+import { noteAccepted } from '../ingest/ingestFloor.js';
 import {
   queryLogs,
   type LogCursor,
   type QueryLogsFilters,
 } from '../repositories/logsRepository.js';
+import { metrics } from '../observability/metrics.js';
 
 const LEVELS = ['debug', 'info', 'warn', 'error'];
 const DEFAULT_LIMIT = 100;
@@ -29,8 +31,13 @@ async function handlePostLogs(request: FastifyRequest, reply: FastifyReply) {
     return reply.status(400).send({ error: 'request body must be an object with a "logs" array' });
   }
 
+  metrics.requests.post++;
+  const started = performance.now();
+
   const rawLogs = (body as Record<string, unknown>).logs as unknown[];
-  const { accepted, rejected } = processLogBatch(rawLogs);
+  const { accepted, rejected, oldestAcceptedMs } = processLogBatch(rawLogs);
+  metrics.entries.accepted += accepted.length;
+  metrics.entries.rejected += rejected.length;
 
   if (accepted.length === 0) {
     return reply.status(400).send({ error: 'all entries were rejected', rejected });
@@ -39,7 +46,13 @@ async function handlePostLogs(request: FastifyRequest, reply: FastifyReply) {
   // Resolves only once the commit carrying these rows has returned, so a 200
   // still means Postgres holds the data — the buffer batches writes, it does
   // not acknowledge them early. A flush failure throws and becomes a 5xx.
+  // Published before the rows can be queried, so an aggregate can never see a
+  // backdated entry's minute as settled while that entry is still unfolded.
+  noteAccepted(oldestAcceptedMs);
+
   await enqueue(accepted);
+
+  metrics.latency.post.record(performance.now() - started);
 
   return reply.status(200).send({
     accepted: accepted.length,
@@ -53,7 +66,12 @@ async function handleGetLogs(request: FastifyRequest, reply: FastifyReply) {
     return reply.status(400).send({ error: parsed.error });
   }
 
+  metrics.requests.getLogs++;
+  const started = performance.now();
+
   const { rows, hasMore } = await queryLogs(parsed.filters);
+
+  metrics.latency.getLogs.record(performance.now() - started);
 
   // hasMore comes from a lookahead row the repository fetched and discarded, so
   // the cursor is non-null only when a further page genuinely exists.

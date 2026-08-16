@@ -29,6 +29,12 @@ const GET_RATE    = num('get-rate', 1);        // GET /logs requests/sec
 const AGG_WINDOW  = num('agg-window', 3600);   // seconds of history the aggregate spans
 const AGG_BUCKET  = str('agg-bucket', '1m');
 const AGG_GROUP   = str('agg-group', 'service');
+// Filters that no rollup can answer, so the aggregate has to read raw rows.
+// These are the queries that used to take the whole database down, and they are
+// still the expensive ones — the point of measuring them separately is to show
+// what bounds them now that the rollup cannot.
+const AGG_Q       = str('agg-q', '');
+const AGG_ATTR    = str('agg-attr', '');
 const DRAIN       = num('drain', 30);          // seconds allowed to read everything back
 const DRAIN_LIMIT = num('drain-limit', 1000);
 const SAMPLE_MS   = num('sample', 5000);       // throughput sample interval
@@ -174,7 +180,9 @@ async function runTask(kind) {
     const until = new Date(Date.now() + 60000).toISOString();
     const since = new Date(Date.now() + 60000 - AGG_WINDOW * 1000).toISOString();
     const group = AGG_GROUP === 'none' ? '' : `&group_by=${AGG_GROUP}`;
-    const r = await call('GET', `/logs/aggregate?since=${since}&until=${until}&bucket=${AGG_BUCKET}${group}`);
+    const q = AGG_Q === '' ? '' : `&q=${encodeURIComponent(AGG_Q)}`;
+    const attr = AGG_ATTR === '' ? '' : `&attr.${AGG_ATTR}`;
+    const r = await call('GET', `/logs/aggregate?since=${since}&until=${until}&bucket=${AGG_BUCKET}${group}${q}${attr}`);
     record('aggregate', r);
     if (r.status === 200) checkAggShape(r.raw);
     return;
@@ -240,7 +248,8 @@ async function drain(runStartIso) {
 
 // --------------------------------------------------------------------- main
 console.log(`[scenario] rate=${RATE} logs/s batch=${BATCH} vus=${VUS} duration=${DURATION}s ` +
-            `agg=${AGG_RATE}/s (${AGG_BUCKET}, ${AGG_WINDOW}s window, group_by=${AGG_GROUP}) get=${GET_RATE}/s drain=${DRAIN}s`);
+            `agg=${AGG_RATE}/s (${AGG_BUCKET}, ${AGG_WINDOW}s window, group_by=${AGG_GROUP}` +
+            `${AGG_Q ? `, q=${AGG_Q}` : ''}${AGG_ATTR ? `, attr.${AGG_ATTR}` : ''}) get=${GET_RATE}/s drain=${DRAIN}s`);
 
 const runStartIso = new Date(Date.now() - 5000).toISOString();
 startedAt = performance.now();

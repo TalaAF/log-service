@@ -5,6 +5,8 @@ import {
   GROUP_BY_COLUMNS,
   type AggregateFilters,
 } from '../repositories/aggregateRepository.js';
+import { withAggregateSlot } from '../observability/aggregateGate.js';
+import { metrics } from '../observability/metrics.js';
 
 const LEVELS = ['debug', 'info', 'warn', 'error'];
 const ATTR_PREFIX = 'attr.';
@@ -19,7 +21,15 @@ async function handleGetAggregate(request: FastifyRequest, reply: FastifyReply) 
     return reply.status(400).send({ error: parsed.error });
   }
 
-  const buckets = await aggregateLogs(parsed.filters);
+  metrics.requests.aggregate++;
+  const started = performance.now();
+
+  // Validation is done before queueing, so a malformed request still gets its
+  // 400 immediately rather than waiting behind expensive work it was never
+  // going to do. Everything past this point can touch raw rows.
+  const { buckets } = await withAggregateSlot(() => aggregateLogs(parsed.filters));
+
+  metrics.latency.aggregate.record(performance.now() - started);
 
   return reply.status(200).send({ buckets });
 }

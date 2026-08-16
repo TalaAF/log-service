@@ -91,6 +91,12 @@ services:
       - pg_stat_statements.track=top
     ports:
       - "5432:5432"
+      # Second mapping for the test harness. A native Postgres on the developer
+      # machine binds 5432 too, and Windows lets both listen, so a client
+      # connecting there reaches whichever won the race rather than this
+      # container. 55432 is unambiguous. Nothing in the service uses it: the app
+      # reaches Postgres over the compose network.
+      - "55432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -128,6 +134,18 @@ services:
       DB_POOL_MAX: "8"
       DB_WRITE_POOL_MAX: "4"
       LOG_LEVEL: "warn"
+      # Rollups. LAG is how far behind now() the rollup/raw boundary sits: it
+      # has to cover group-commit buffering plus client/server clock skew, and
+      # it sets how much raw data a hybrid aggregate still has to read. See
+      # syncRollupConfig in src/db/migrate.ts.
+      ROLLUP_LAG_SECONDS: "${ROLLUP_LAG_SECONDS:-10}"
+      INGEST_FLOOR_WINDOW_SECONDS: "${INGEST_FLOOR_WINDOW_SECONDS:-20}"
+      ROLLUP_RETENTION_DAYS: "${ROLLUP_RETENTION_DAYS:-${RETENTION_DAYS:-30}}"
+      # Expensive aggregates allowed to execute at once. Postgres has one core,
+      # so this is not a parallelism setting — it is the cap that stops
+      # analytical reads taking the core away from ingestion and from GET /logs.
+      # Kept well below DB_POOL_MAX so paged reads always have connections left.
+      AGGREGATE_CONCURRENCY: "${AGGREGATE_CONCURRENCY:-2}"
     ports:
       - "8080:8080"
     healthcheck:

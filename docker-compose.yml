@@ -31,6 +31,24 @@ services:
       - synchronous_commit=off
       - -c
       - wal_writer_delay=200ms
+      # Both are left at PostgreSQL's defaults, and are parameterised only so
+      # bench/coldwarm.sh can A/B them without editing this file.
+      #
+      # The theory was that a freshly created Docker volume makes allocation
+      # expensive: wal_init_zero=on zero-fills each new 16MB segment before use,
+      # and a cold run creates 54 of them where a warm run recycles. The
+      # zero-filling is real and measurable in the file counts, but it is not
+      # measurable in throughput. Over three cold runs each at a load high
+      # enough to be capacity-limited (the 45k stage of the ramp), init=off came
+      # out +2.9% on the mean — against a within-group spread of ~2,400 logs/s,
+      # so the groups overlap and the difference is noise (t=1.08, p~0.34).
+      #
+      # Left on. Turning it off trades a documented durability safeguard on
+      # filesystems that need it for an effect this one cannot measure.
+      - -c
+      - wal_init_zero=${WAL_INIT_ZERO:-on}
+      - -c
+      - wal_recycle=${WAL_RECYCLE:-on}
       - -c
       - wal_writer_flush_after=2MB
       # Checkpoint spreading. The default 1 GB max_wal_size forces frequent

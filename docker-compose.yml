@@ -54,6 +54,7 @@ services:
       # Checkpoint spreading. The default 1 GB max_wal_size forces frequent
       # checkpoints under sustained ingest, and every checkpoint makes the next
       # write to each page a full-page WAL record — pure write amplification.
+      
       - -c
       - max_wal_size=4GB
       - -c

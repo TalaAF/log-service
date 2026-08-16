@@ -37,17 +37,21 @@ function intFromEnv(name: string, fallback: number): number {
 /**
  * How long an accepted batch keeps holding the boundary down.
  *
- * Bounded below by how long a row can stay unfolded: the refresh interval (10s)
+ * Bounded below by how long a row can stay unfolded: the refresh interval (5s)
  * plus the second the application caches the published boundary for, so about
- * eleven. Dropping a sample earlier than that would release the boundary over
- * rows that are still missing from the rollup. Bounded above by cost — this
- * window is also a floor under how close the boundary can get to now(), and
- * every second of it is another 15,000 raw rows a hybrid aggregate has to read.
+ * six. Dropping a sample earlier than that would release the boundary over rows
+ * that are still missing from the rollup.
  *
- * 20 seconds sits between the two with room to absorb a refresh that is skipped
+ * Bounded above by cost. This window is also a floor under how close the
+ * boundary can get to now(), and every second of it is another N rows a hybrid
+ * aggregate has to read — where N is the ingest rate, so 15,000 rows a second
+ * at the nominal load and 45,000 at the top of the ramp. That is why it is not
+ * simply set generously.
+ *
+ * 12 seconds sits between the two with room to absorb a refresh that is skipped
  * or runs long.
  */
-const WINDOW_SECONDS = intFromEnv('INGEST_FLOOR_WINDOW_SECONDS', 20);
+const WINDOW_SECONDS = intFromEnv('INGEST_FLOOR_WINDOW_SECONDS', 12);
 
 /**
  * One slot per second of the window, indexed by wall-clock second. A flat ring

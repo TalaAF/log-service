@@ -1,5 +1,6 @@
 import type { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
 import {
+  aggregateCost,
   aggregateLogs,
   BUCKET_SECONDS,
   GROUP_BY_COLUMNS,
@@ -27,7 +28,13 @@ async function handleGetAggregate(request: FastifyRequest, reply: FastifyReply) 
   // Validation is done before queueing, so a malformed request still gets its
   // 400 immediately rather than waiting behind expensive work it was never
   // going to do. Everything past this point can touch raw rows.
-  const { buckets } = await withAggregateSlot(() => aggregateLogs(parsed.filters));
+  //
+  // The lane is chosen from the filters alone, which is enough to know whether
+  // the rollup can contribute: a cheap request must not queue behind an
+  // unbounded scan just because both are aggregates.
+  const { buckets } = await withAggregateSlot(aggregateCost(parsed.filters), () =>
+    aggregateLogs(parsed.filters)
+  );
 
   metrics.latency.aggregate.record(performance.now() - started);
 

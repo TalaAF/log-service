@@ -19,9 +19,6 @@ export const GROUP_BY_COLUMNS: Record<string, string> = {
   level: 'level',
 };
 
-/** Width of one stored rollup row. Every supported bucket is a multiple of it. */
-const ROLLUP_SECONDS = 60;
-
 export interface AggregateFilters {
   since: string;
   until: string;
@@ -41,6 +38,20 @@ export interface AggregateBucket extends Record<string, unknown> {
 
 /** Which sources answered a request. Reported by /internal/stats, not to clients. */
 export type AggregatePath = 'rollup' | 'raw' | 'hybrid';
+
+/**
+ * Cost class, decided before any query runs so admission control can put the
+ * request in the right queue.
+ *
+ * `scan` means the rollup cannot contribute at all, so the whole requested
+ * range is read from raw rows and the cost is unbounded — it grows with however
+ * much history the caller asked for. Everything else is bounded by the refresh
+ * boundary. The distinction is exactly the filters the rollup cannot represent,
+ * so it is derived from them rather than guessed at from the range.
+ */
+export function aggregateCost(filters: AggregateFilters): 'bounded' | 'scan' {
+  return filters.q !== undefined || filters.attributes !== undefined ? 'scan' : 'bounded';
+}
 
 export interface AggregateResult {
   buckets: AggregateBucket[];
@@ -143,14 +154,16 @@ async function planAggregate(filters: AggregateFilters, width: number): Promise<
   if (filters.q !== undefined) return rawOnly;
   if (filters.attributes !== undefined) return rawOnly;
 
-  // A bucket narrower than a stored rollup row cannot be reconstructed from it.
-  // No supported width is, today: 1m is both the smallest offered bucket and the
-  // stored granularity. The check is here so that adding a narrower bucket to
-  // BUCKET_SECONDS degrades to the raw path instead of returning wrong counts.
-  if (width < ROLLUP_SECONDS || width % ROLLUP_SECONDS !== 0) return rawOnly;
-
   const state = await getRollupState();
   if (state.safeBefore === null) return rawOnly;
+
+  // A requested bucket that is not a whole multiple of the stored width cannot
+  // be assembled from stored rows -- the edges would not line up and the sum
+  // would be partial. Every width the API offers is a multiple of the stored
+  // ten seconds; the check is here so that changing either one degrades to the
+  // raw path instead of quietly returning wrong counts.
+  const stored = state.bucketSeconds;
+  if (stored <= 0 || width < stored || width % stored !== 0) return rawOnly;
 
   const since = Date.parse(filters.since);
   const until = Date.parse(filters.until);
@@ -163,12 +176,12 @@ async function planAggregate(filters: AggregateFilters, width: number): Promise<
   // to the oldest timestamp this process has recently accepted, which puts that
   // entry's minute back on the raw side where it is counted. In the steady
   // state the floor is newer than the published boundary and this is a no-op.
-  const boundary = Math.min(state.safeBefore.getTime(), floorMinute(acceptedFloorMs()));
+  const boundary = Math.min(state.safeBefore.getTime(), floorBucket(acceptedFloorMs(), stored));
 
   // The rollup can serve [rollupFrom, rollupUntil): inside the request, below
   // the refresh boundary, and on whole-minute edges at both ends.
-  const rollupFrom = ceilMinute(since, filters.since);
-  const rollupUntil = floorMinute(Math.min(until, boundary));
+  const rollupFrom = ceilBucket(since, filters.since, stored);
+  const rollupUntil = floorBucket(Math.min(until, boundary), stored);
 
   if (rollupFrom >= rollupUntil) return rawOnly;
 
@@ -332,9 +345,9 @@ function mergeBuckets(sources: AggregateBucket[][]): AggregateBucket[] {
 
   for (const rows of sources) {
     for (const row of rows) {
-      //   cannot appear in a service name or a level: validation strips it
+      // A NUL cannot appear in a service name or a level: validation strips it
       // before anything is stored, so it is safe as a key separator.
-      const key = `${row.start} ${row.group ?? ''}`;
+      const key = `${row.start}\u0000${row.group ?? ''}`;
       const existing = merged.get(key);
       if (existing === undefined) merged.set(key, { ...row });
       else existing.count += row.count;
@@ -344,32 +357,31 @@ function mergeBuckets(sources: AggregateBucket[][]): AggregateBucket[] {
   return [...merged.values()];
 }
 
-const MINUTE_MS = 60_000;
-
 /** Sub-millisecond digits, which Date.parse silently drops but Postgres keeps. */
 const SUB_MS_PRECISION = /\.\d{4,}/;
 
-function floorMinute(ms: number): number {
+function floorBucket(ms: number, bucketSeconds: number): number {
   if (!Number.isFinite(ms)) return ms;
-  return Math.floor(ms / MINUTE_MS) * MINUTE_MS;
+  const width = bucketSeconds * 1000;
+  return Math.floor(ms / width) * width;
 }
 
 /**
- * Smallest whole minute at or after `ms`.
+ * Smallest stored bucket edge at or after `ms`.
  *
  * Rounding *up* is what keeps the rollup honest at the start of a range: a
- * request beginning at 10:00:30 must not be served the rollup row for 10:00,
- * which also counts the first thirty seconds. The raw path covers the remainder.
+ * request beginning at 10:00:05 must not be served the stored row for 10:00:00,
+ * which also counts the first five seconds. The raw path covers the remainder.
  *
  * `raw` is consulted because Date.parse truncates to milliseconds. A timestamp
- * of 10:00:00.000400Z parses to an exact minute, and treating it as one would
+ * of 10:00:00.000400Z parses to an exact edge, and treating it as one would
  * pull in 400 microseconds of rows the caller excluded — so anything carrying
- * finer precision is rounded up to the next minute regardless.
+ * finer precision is rounded up to the next edge regardless.
  */
-function ceilMinute(ms: number, raw: string): number {
-  const floored = floorMinute(ms);
+function ceilBucket(ms: number, raw: string, bucketSeconds: number): number {
+  const floored = floorBucket(ms, bucketSeconds);
   if (floored === ms && !SUB_MS_PRECISION.test(raw)) return ms;
-  return floored + MINUTE_MS;
+  return floored + bucketSeconds * 1000;
 }
 
 function isoUtc(ms: number): string {

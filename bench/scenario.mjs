@@ -35,6 +35,11 @@ const AGG_GROUP   = str('agg-group', 'service');
 // what bounds them now that the rollup cannot.
 const AGG_Q       = str('agg-q', '');
 const AGG_ATTR    = str('agg-attr', '');
+// Ramped load, for the stress and breakpoint scenarios the official benchmark
+// runs: --stages "15000:40,22500:40,30000:40" means 40s at each rate. The point
+// of ramping is not the peak number but whether throughput keeps climbing or
+// falls off a cliff, so each stage is reported separately.
+const STAGES_ARG  = str('stages', '');
 const DRAIN       = num('drain', 30);          // seconds allowed to read everything back
 const DRAIN_LIMIT = num('drain-limit', 1000);
 const SAMPLE_MS   = num('sample', 5000);       // throughput sample interval
@@ -153,7 +158,41 @@ function checkAggShape(raw) {
 // Wants POSTs at RATE/BATCH per second and queries at their own rates. A task is
 // only dispatched when a VU is free, so an operation that blocks its VU directly
 // suppresses the achieved rate — the closed-loop behaviour the grader exhibits.
-const postPerSec = RATE / BATCH;
+const STAGES = STAGES_ARG === ''
+  ? [{ rate: RATE, seconds: DURATION }]
+  : STAGES_ARG.split(',').map((part) => {
+      const [rate, seconds] = part.split(':').map(Number);
+      return { rate, seconds };
+    });
+const TOTAL_SECONDS = STAGES.reduce((a, st) => a + st.seconds, 0);
+
+/**
+ * POSTs that *should* have been dispatched by `elapsed`, integrating the rate
+ * over the stage schedule. A flat rate is just the one-stage case, so both
+ * modes go through the same scheduler.
+ */
+function targetPostsBy(elapsed) {
+  let total = 0;
+  let remaining = elapsed;
+  for (const stage of STAGES) {
+    if (remaining <= 0) break;
+    const dt = Math.min(remaining, stage.seconds);
+    total += (stage.rate / BATCH) * dt;
+    remaining -= dt;
+  }
+  return total;
+}
+
+/** Which stage `elapsed` falls in, for per-stage reporting. */
+function stageAt(elapsed) {
+  let acc = 0;
+  for (let i = 0; i < STAGES.length; i++) {
+    acc += STAGES[i].seconds;
+    if (elapsed < acc) return i;
+  }
+  return STAGES.length - 1;
+}
+
 let startedAt = 0;
 let dispatchedPost = 0, dispatchedAgg = 0, dispatchedGet = 0;
 let running = true;
@@ -162,7 +201,7 @@ function nextTask() {
   const elapsed = (performance.now() - startedAt) / 1000;
   if (Math.floor(elapsed * AGG_RATE) > dispatchedAgg) { dispatchedAgg++; return 'aggregate'; }
   if (Math.floor(elapsed * GET_RATE) > dispatchedGet) { dispatchedGet++; return 'getlogs'; }
-  if (Math.floor(elapsed * postPerSec) > dispatchedPost) { dispatchedPost++; return 'post'; }
+  if (targetPostsBy(elapsed) > dispatchedPost) { dispatchedPost++; return 'post'; }
   return null;
 }
 
@@ -249,7 +288,8 @@ async function drain(runStartIso) {
 // --------------------------------------------------------------------- main
 console.log(`[scenario] rate=${RATE} logs/s batch=${BATCH} vus=${VUS} duration=${DURATION}s ` +
             `agg=${AGG_RATE}/s (${AGG_BUCKET}, ${AGG_WINDOW}s window, group_by=${AGG_GROUP}` +
-            `${AGG_Q ? `, q=${AGG_Q}` : ''}${AGG_ATTR ? `, attr.${AGG_ATTR}` : ''}) get=${GET_RATE}/s drain=${DRAIN}s`);
+            `${AGG_Q ? `, q=${AGG_Q}` : ''}${AGG_ATTR ? `, attr.${AGG_ATTR}` : ''}) get=${GET_RATE}/s drain=${DRAIN}s` +
+            `${STAGES_ARG ? ` stages=${STAGES_ARG}` : ''}`);
 
 const runStartIso = new Date(Date.now() - 5000).toISOString();
 startedAt = performance.now();
@@ -259,12 +299,13 @@ const sampler = setInterval(() => {
   acceptedAtLastSample = accepted;
   const t = Math.round((performance.now() - startedAt) / 1000);
   const rate = Math.round(delta / (SAMPLE_MS / 1000));
-  samples.push({ t, logs_per_sec: rate });
-  console.log(`  t=${String(t).padStart(3)}s  ${String(rate).padStart(6)} logs/s`);
+  const stage = stageAt(t);
+  samples.push({ t, stage, offered: STAGES[stage].rate, logs_per_sec: rate });
+  console.log(`  t=${String(t).padStart(3)}s  stage ${stage} (offered ${STAGES[stage].rate})  ${String(rate).padStart(6)} logs/s`);
 }, SAMPLE_MS);
 
 const vus = Array.from({ length: VUS }, () => vu());
-await new Promise((r) => setTimeout(r, DURATION * 1000));
+await new Promise((r) => setTimeout(r, TOTAL_SECONDS * 1000));
 running = false;
 clearInterval(sampler);
 await Promise.all(vus);
@@ -278,7 +319,8 @@ console.log('\n[scenario] load phase complete, draining...');
 const drainResult = await drain(runStartIso);
 
 console.log('\n' + JSON.stringify({
-  config: { target_logs_per_sec: RATE, batch: BATCH, vus: VUS, duration_s: DURATION,
+  config: { target_logs_per_sec: RATE, batch: BATCH, vus: VUS, duration_s: TOTAL_SECONDS,
+            stages: STAGES,
             aggregate: `${AGG_BUCKET}/${AGG_WINDOW}s/group_by=${AGG_GROUP}` },
   throughput: {
     accepted_logs: accepted,
@@ -290,6 +332,18 @@ console.log('\n' + JSON.stringify({
     http_requests: counts.post + counts.aggregate + counts.getlogs,
   },
   operations: counts,
+  per_stage: STAGES.map((stage, i) => {
+    const mine = samples.filter((x) => x.stage === i);
+    // The first sample of a stage straddles the boundary, so it is dropped.
+    const settled = mine.slice(1);
+    return {
+      offered_logs_per_sec: stage.rate,
+      seconds: stage.seconds,
+      achieved_logs_per_sec: settled.length
+        ? Math.round(settled.reduce((a, x) => a + x.logs_per_sec, 0) / settled.length)
+        : null,
+    };
+  }),
   latency_ms: {
     post:      { p50: pct(lat.post, 50),      p95: pct(lat.post, 95),      p99: pct(lat.post, 99) },
     aggregate: { p50: pct(lat.aggregate, 50), p95: pct(lat.aggregate, 95), p99: pct(lat.aggregate, 99) },

@@ -12,6 +12,13 @@ import { db } from '../db/client.js';
  */
 export interface RollupState {
   safeBefore: Date | null;
+  /**
+   * Width of a stored rollup row, in seconds. Read from the database rather
+   * than assumed, because the query path aligns its boundary to this and a
+   * disagreement between the two would not fail loudly -- it would return
+   * counts that are wrong by whatever fell into the mismatched fragment.
+   */
+  bucketSeconds: number;
   watermarkId: string;
   lastRefreshAt: Date | null;
   lastRows: number;
@@ -45,6 +52,7 @@ let inFlight: Promise<RollupState> | null = null;
 
 interface StateRow extends Record<string, unknown> {
   safe_before: Date | string | null;
+  bucket_seconds: number;
   watermark_id: string;
   last_refresh_at: Date | string | null;
   last_rows: number;
@@ -56,6 +64,7 @@ interface StateRow extends Record<string, unknown> {
 
 const UNAVAILABLE: RollupState = {
   safeBefore: null,
+  bucketSeconds: 60,
   watermarkId: '0',
   lastRefreshAt: null,
   lastRows: 0,
@@ -67,16 +76,18 @@ const UNAVAILABLE: RollupState = {
 
 async function read(): Promise<RollupState> {
   const result = await db.execute<StateRow>(sql`
-    SELECT safe_before,
-           watermark_id::text AS watermark_id,
-           last_refresh_at,
-           last_rows,
-           last_duration_ms,
-           refreshes,
-           skipped,
-           behind
-    FROM rollup_state
-    WHERE id
+    SELECT rs.safe_before,
+           rc.bucket_seconds,
+           rs.watermark_id::text AS watermark_id,
+           rs.last_refresh_at,
+           rs.last_rows,
+           rs.last_duration_ms,
+           rs.refreshes,
+           rs.skipped,
+           rs.behind
+    FROM rollup_state rs
+    CROSS JOIN rollup_config rc
+    WHERE rs.id AND rc.id
   `);
 
   const row = result.rows[0];
@@ -84,6 +95,7 @@ async function read(): Promise<RollupState> {
 
   return {
     safeBefore: row.safe_before === null ? null : new Date(row.safe_before),
+    bucketSeconds: Number(row.bucket_seconds),
     watermarkId: row.watermark_id,
     lastRefreshAt: row.last_refresh_at === null ? null : new Date(row.last_refresh_at),
     lastRows: Number(row.last_rows),

@@ -79,7 +79,7 @@ async function settle() {
  * would be answered from raw rows and the rollup path would never be exercised
  * at all — the tests would pass while proving nothing.
  */
-const FLOOR_WINDOW_MS = num('floor-window', 30) * 1000;
+const FLOOR_WINDOW_MS = num('floor-window', 12) * 1000;
 async function floorLapses() {
   process.stdout.write(`  waiting ${FLOOR_WINDOW_MS / 1000}s for the ingest floor to lapse... `);
   await sleep(FLOOR_WINDOW_MS + 2000);
@@ -314,14 +314,23 @@ try {
     { since: from, until: from, bucket: '1m', groupBy: 'service' });
 
   {
-    // A range starting or ending mid-minute has to take its partial minute from
-    // raw rows and the rest from the rollup, which is the hybrid path. Two of
-    // the six cases above cannot use the rollup at all — one narrower than a
-    // single bucket, one empty — so those are the only raw ones.
+    // A range whose edges do not land on a stored bucket boundary has to take
+    // the partial bucket from raw rows and the rest from the rollup, which is
+    // the hybrid path.
+    //
+    // These counts depend on the stored granularity, which is the point: at the
+    // ten seconds stored today, three of the six cases straddle an edge, two sit
+    // exactly on one (+30s and the +10s..+20s range) and are served wholly from
+    // the rollup, and the empty range has nothing to read. At a minute the split
+    // was 4/1/1. If this assertion fails after a granularity change, check the
+    // arithmetic before changing the number.
     const after = await paths();
-    check('unaligned ranges combined both sources', after.hybrid - pathsBeforeEdges.hybrid === 4,
+    check('unaligned ranges combined both sources', after.hybrid - pathsBeforeEdges.hybrid === 3,
       `${JSON.stringify(pathsBeforeEdges)} -> ${JSON.stringify(after)}`);
-    check('sub-bucket and empty ranges went raw', after.raw - pathsBeforeEdges.raw === 2,
+    check('bucket-aligned ranges came wholly from the rollup',
+      after.rollup - pathsBeforeEdges.rollup === 2,
+      `${JSON.stringify(pathsBeforeEdges)} -> ${JSON.stringify(after)}`);
+    check('the empty range went raw', after.raw - pathsBeforeEdges.raw === 1,
       `${JSON.stringify(pathsBeforeEdges)} -> ${JSON.stringify(after)}`);
   }
 

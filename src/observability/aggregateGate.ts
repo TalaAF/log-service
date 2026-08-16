@@ -31,33 +31,59 @@ function intFromEnv(name: string, fallback: number): number {
   return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
 }
 
-const LIMIT = intFromEnv('AGGREGATE_CONCURRENCY', 2);
+/**
+ * Aggregates come in two cost classes and they do not belong in one queue.
+ *
+ * A rollup or hybrid request reads pre-aggregated rows plus, at most, the hot
+ * tail — bounded by the refresh boundary, tens of milliseconds in practice.
+ * A request carrying `q` or an `attr.*` filter cannot use the rollup at all and
+ * reads every raw row in the requested range: measured at 27s p95 under load,
+ * during which it halved ingestion throughput.
+ *
+ * Sharing one limit forces a choice between throttling the cheap queries
+ * needlessly and letting the expensive ones run several at a time. Splitting
+ * them lets the bounded class stay responsive while the unbounded class is held
+ * to a single concurrent scan, which is what actually protects the write path.
+ */
+const BOUNDED_LIMIT = intFromEnv('AGGREGATE_CONCURRENCY', 2);
+const SCAN_LIMIT = intFromEnv('AGGREGATE_SCAN_CONCURRENCY', 1);
 
-let active = 0;
-const queue: Array<() => void> = [];
+/** Cost class of an aggregate, decided by the repository's routing. */
+export type AggregateCost = 'bounded' | 'scan';
 
-function acquire(): Promise<void> {
-  if (active < LIMIT) {
-    active++;
+interface Lane {
+  limit: number;
+  active: number;
+  queue: Array<() => void>;
+}
+
+const lanes: Record<AggregateCost, Lane> = {
+  bounded: { limit: BOUNDED_LIMIT, active: 0, queue: [] },
+  scan: { limit: SCAN_LIMIT, active: 0, queue: [] },
+};
+
+function acquire(lane: Lane): Promise<void> {
+  if (lane.active < lane.limit) {
+    lane.active++;
     return Promise.resolve();
   }
 
   metrics.aggregateAdmission.queued++;
-  if (queue.length + 1 > metrics.aggregateAdmission.maxQueueDepth) {
-    metrics.aggregateAdmission.maxQueueDepth = queue.length + 1;
+  if (lane.queue.length + 1 > metrics.aggregateAdmission.maxQueueDepth) {
+    metrics.aggregateAdmission.maxQueueDepth = lane.queue.length + 1;
   }
 
   return new Promise<void>((resolve) => {
-    queue.push(() => {
-      active++;
+    lane.queue.push(() => {
+      lane.active++;
       resolve();
     });
   });
 }
 
-function release(): void {
-  active--;
-  const next = queue.shift();
+function release(lane: Lane): void {
+  lane.active--;
+  const next = lane.queue.shift();
   if (next !== undefined) next();
 }
 
@@ -69,18 +95,22 @@ function release(): void {
  * never be answered from a view of the data older than the moment it started
  * running. Queueing changes when a request is served, never what it sees.
  */
-export async function withAggregateSlot<T>(work: () => Promise<T>): Promise<T> {
+export async function withAggregateSlot<T>(cost: AggregateCost, work: () => Promise<T>): Promise<T> {
+  const lane = lanes[cost];
   const waitStart = performance.now();
-  await acquire();
+  await acquire(lane);
   metrics.latency.aggregateWait.record(performance.now() - waitStart);
 
   try {
     return await work();
   } finally {
-    release();
+    release(lane);
   }
 }
 
 export function gateStats() {
-  return { limit: LIMIT, active, waiting: queue.length };
+  return {
+    bounded: { limit: lanes.bounded.limit, active: lanes.bounded.active, waiting: lanes.bounded.queue.length },
+    scan: { limit: lanes.scan.limit, active: lanes.scan.active, waiting: lanes.scan.queue.length },
+  };
 }

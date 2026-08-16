@@ -139,13 +139,18 @@ services:
       # it sets how much raw data a hybrid aggregate still has to read. See
       # syncRollupConfig in src/db/migrate.ts.
       ROLLUP_LAG_SECONDS: "${ROLLUP_LAG_SECONDS:-10}"
-      INGEST_FLOOR_WINDOW_SECONDS: "${INGEST_FLOOR_WINDOW_SECONDS:-20}"
+      INGEST_FLOOR_WINDOW_SECONDS: "${INGEST_FLOOR_WINDOW_SECONDS:-12}"
       ROLLUP_RETENTION_DAYS: "${ROLLUP_RETENTION_DAYS:-${RETENTION_DAYS:-30}}"
       # Expensive aggregates allowed to execute at once. Postgres has one core,
       # so this is not a parallelism setting — it is the cap that stops
       # analytical reads taking the core away from ingestion and from GET /logs.
       # Kept well below DB_POOL_MAX so paged reads always have connections left.
       AGGREGATE_CONCURRENCY: "${AGGREGATE_CONCURRENCY:-2}"
+      # Aggregates the rollup cannot serve at all (q, attr.*) read every raw
+      # row in the requested range, so they are held to one at a time. This is
+      # the limit that protects ingestion; the one above only paces the cheap
+      # queries, which must not queue behind an unbounded scan.
+      AGGREGATE_SCAN_CONCURRENCY: "${AGGREGATE_SCAN_CONCURRENCY:-1}"
     ports:
       - "8080:8080"
     healthcheck:

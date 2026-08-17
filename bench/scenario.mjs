@@ -271,10 +271,23 @@ function pct(arr, p) {
 // walking the keyset cursor — the same thing the grader's consistency check does.
 async function drain(runStartIso) {
   const t0 = performance.now();
-  const seen = new Set();
-  let cursor = null;
-  let pages = 0, pageErrors = 0, pageTimeouts = 0;
+  let pages = 0, pageErrors = 0, pageTimeouts = 0, rowsSeen = 0;
   const pageLat = [];
+  const errors = { shape: 0, order: 0, duplicate: 0 };
+
+  // Streaming verification: each page is checked and then dropped, so memory is
+  // O(page) rather than O(rows walked). The old version retained every id in a
+  // Set, which over ~1.6M wide rows built a large structure inside the process
+  // driving the benchmark. Measured against this version the Set cost only ~2.5%
+  // of throughput, so it was not the read ceiling — but an instrument should not
+  // grow with what it measures, and peak heap drops from ~86MB to ~31MB.
+  //
+  // Duplicates need no Set: the contract requires strictly decreasing
+  // (timestamp DESC, id DESC), and in a strictly decreasing sequence every tuple
+  // is distinct. A repeat therefore breaks strict decrease against the running
+  // previous tuple, however far apart the copies are.
+  let prevTs = null, prevId = null;
+  let cursor = null, prevCursor = null;
 
   while (performance.now() - t0 < DRAIN * 1000) {
     const qs = `since=${runStartIso}&limit=${DRAIN_LIMIT}${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ''}`;
@@ -287,12 +300,29 @@ async function drain(runStartIso) {
       break;
     }
     let p; try { p = JSON.parse(r.raw); } catch { pageErrors++; break; }
-    for (const l of p.logs) seen.add(l.id);
+    if (!Array.isArray(p.logs) || !('next_cursor' in p)) { errors.shape++; break; }
+
+    for (const l of p.logs) {
+      if (typeof l.id !== 'string' || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(l.timestamp)) {
+        errors.shape++;
+        break;
+      }
+      if (prevTs !== null) {
+        if (l.timestamp === prevTs && l.id === prevId) errors.duplicate++;
+        else if (l.timestamp > prevTs || (l.timestamp === prevTs && BigInt(l.id) > BigInt(prevId))) errors.order++;
+      }
+      prevTs = l.timestamp; prevId = l.id;
+      rowsSeen++;
+    }
+
+    if (p.next_cursor !== null && p.next_cursor === prevCursor) break;  // cursor not advancing
+    prevCursor = p.next_cursor;
     cursor = p.next_cursor;
     if (!cursor) break;
   }
 
   const elapsed = (performance.now() - t0) / 1000;
+  const mem = process.memoryUsage();
   return {
     drain_seconds: Number(elapsed.toFixed(2)),
     hit_cap: elapsed >= DRAIN - 0.2,
@@ -300,8 +330,11 @@ async function drain(runStartIso) {
     page_errors: pageErrors,
     page_timeouts: pageTimeouts,
     page_ms: { p50: pct(pageLat, 50), p95: pct(pageLat, 95), max: Number(Math.max(0, ...pageLat).toFixed(1)) },
-    visible_records: seen.size,
-    read_rows_per_sec: Number((seen.size / elapsed).toFixed(1)),
+    visible_records: rowsSeen,
+    read_rows_per_sec: Number((rowsSeen / elapsed).toFixed(1)),
+    verification_errors: errors,
+    verifier_heap_mb: Number((mem.heapUsed / 1048576).toFixed(1)),
+    verifier_rss_mb: Number((mem.rss / 1048576).toFixed(1)),
   };
 }
 

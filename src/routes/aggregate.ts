@@ -24,6 +24,7 @@ async function handleGetAggregate(request: FastifyRequest, reply: FastifyReply) 
 
   metrics.requests.aggregate++;
   const started = performance.now();
+  const releaseKey = noteAggregateKey(parsed.filters);
 
   // Validation is done before queueing, so a malformed request still gets its
   // 400 immediately rather than waiting behind expensive work it was never
@@ -32,13 +33,72 @@ async function handleGetAggregate(request: FastifyRequest, reply: FastifyReply) 
   // The lane is chosen from the filters alone, which is enough to know whether
   // the rollup can contribute: a cheap request must not queue behind an
   // unbounded scan just because both are aggregates.
+  // Execution is timed inside the slot so queue wait and database work are two
+  // independent measurements rather than one derived by subtracting the other.
   const { buckets } = await withAggregateSlot(aggregateCost(parsed.filters), () =>
-    aggregateLogs(parsed.filters)
+    (async () => {
+      const execStart = performance.now();
+      try {
+        return await aggregateLogs(parsed.filters);
+      } finally {
+        metrics.latency.aggregateExec.record(performance.now() - execStart);
+        releaseKey();
+      }
+    })()
   );
 
   metrics.latency.aggregate.record(performance.now() - started);
 
   return reply.status(200).send({ buckets });
+}
+
+/**
+ * Counts how much aggregate traffic is semantically repeated.
+ *
+ * Coalescing identical in-flight requests, or a short TTL cache, can only help
+ * in proportion to how often the same logical question is asked. The key is
+ * every parameter that can change the answer, so two requests sharing it are
+ * genuinely interchangeable; anything less would risk answering one query with
+ * another's result.
+ *
+ * `duplicates` counts repeats over the retained window, and
+ * `concurrentDuplicates` counts the stricter case that in-flight coalescing
+ * could actually remove: a request arriving while an identical one is still
+ * running. Diagnostic only — nothing reads these to make a decision.
+ */
+const inFlightKeys = new Map<string, number>();
+const seenKeys = new Set<string>();
+/** Bounded so a long run cannot grow this without limit. */
+const SEEN_KEY_CAP = 20_000;
+
+function aggregateKey(f: AggregateFilters): string {
+  const attrs = Object.entries(f.attributes ?? {})
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+    .map(([k, v]) => `${k}=${v}`)
+    .join(',');
+  return [f.since, f.until, f.bucket, f.groupBy ?? '', f.service ?? '', f.level ?? '', f.q ?? '', attrs].join('|');
+}
+
+function noteAggregateKey(f: AggregateFilters): () => void {
+  const key = aggregateKey(f);
+  metrics.aggregateKeys.requests++;
+
+  if (seenKeys.has(key)) metrics.aggregateKeys.duplicates++;
+  else {
+    if (seenKeys.size >= SEEN_KEY_CAP) seenKeys.clear();
+    seenKeys.add(key);
+    metrics.aggregateKeys.distinctKeys++;
+  }
+
+  const inFlight = inFlightKeys.get(key) ?? 0;
+  if (inFlight > 0) metrics.aggregateKeys.concurrentDuplicates++;
+  inFlightKeys.set(key, inFlight + 1);
+
+  return () => {
+    const n = (inFlightKeys.get(key) ?? 1) - 1;
+    if (n <= 0) inFlightKeys.delete(key);
+    else inFlightKeys.set(key, n);
+  };
 }
 
 /** Validates and normalises the raw query string into repository filters. */

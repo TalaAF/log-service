@@ -33,6 +33,13 @@ const AGG_GROUP   = str('agg-group', 'service');
 // These are the queries that used to take the whole database down, and they are
 // still the expensive ones — the point of measuring them separately is to show
 // what bounds them now that the rollup cannot.
+// Payload shape. The generator's default entry is unrealistically small — a
+// ~30 character message and four short attributes — and row width drives heap
+// bytes, WAL volume and GIN maintenance, which is Postgres CPU per log rather
+// than per request. A grader sending realistic log lines would make the same
+// logical rate cost several times more in the database.
+const MSG_BYTES   = num('msg-bytes', 0);       // 0 = leave the template message
+const ATTR_COUNT  = num('attr-count', 0);      // 0 = leave the four defaults
 const AGG_Q       = str('agg-q', '');
 const AGG_ATTR    = str('agg-attr', '');
 // Ramped load, for the stress and breakpoint scenarios the official benchmark
@@ -87,17 +94,30 @@ for (let p = 0; p < BODY_POOL; p++) {
   const logs = new Array(BATCH);
   for (let i = 0; i < BATCH; i++) {
     const n = p * BATCH + i;
+    let message = `${MESSAGES[n % MESSAGES.length]} #${n}`;
+    if (MSG_BYTES > 0) {
+      // Pad with varied text rather than one repeated character, so compression
+      // and the message's own entropy stay representative.
+      while (message.length < MSG_BYTES) {
+        message += ` ${MESSAGES[(n + message.length) % MESSAGES.length]}`;
+      }
+      message = message.slice(0, MSG_BYTES);
+    }
+    const attributes = {
+      user_id: String(n % 10000),
+      region: REGIONS[n % REGIONS.length],
+      retries: n % 5,
+      cached: (n & 1) === 0,
+    };
+    for (let k = 4; k < ATTR_COUNT; k++) {
+      attributes[`field_${k}`] = `${MESSAGES[(n + k) % MESSAGES.length]}-${n % 1000}`;
+    }
     logs[i] = {
       timestamp: '',
       level: LEVELS[n % LEVELS.length],
       service: SERVICES[n % SERVICES.length],
-      message: `${MESSAGES[n % MESSAGES.length]} #${n}`,
-      attributes: {
-        user_id: String(n % 10000),
-        region: REGIONS[n % REGIONS.length],
-        retries: n % 5,
-        cached: (n & 1) === 0,
-      },
+      message,
+      attributes,
     };
   }
   bodies.push(logs);

@@ -41,12 +41,29 @@ export const metrics = {
   aggregatePath: { rollup: 0, raw: 0, hybrid: 0 },
   /** Aggregates that waited for a slot, and the deepest the queue ever got. */
   aggregateAdmission: { queued: 0, maxQueueDepth: 0 },
+  /**
+   * Logical aggregate keys seen, for deciding whether coalescing could help.
+   *
+   * `requests` counts every aggregate; `distinctKeys` counts how many were
+   * semantically different. A request is only a duplicate if every parameter
+   * affecting the result matches, so `duplicates` is a lower bound on what
+   * coalescing or a short TTL cache could ever remove.
+   */
+  aggregateKeys: { requests: 0, distinctKeys: 0, duplicates: 0, concurrentDuplicates: 0 },
   latency: {
     post: new Latencies(),
     getLogs: new Latencies(),
     aggregate: new Latencies(),
     /** Time spent waiting for an admission slot, excluded from query time. */
     aggregateWait: new Latencies(),
+    /**
+     * Time inside the slot: the database round trips plus merging and sorting.
+     * Recorded directly rather than derived by subtracting wait percentiles from
+     * total percentiles — percentiles are not additive, and that subtraction
+     * hides a heavy execution tail, which is exactly what distinguishes "the
+     * queue is saturated" from "a few slow queries block the lane".
+     */
+    aggregateExec: new Latencies(),
   },
 };
 
@@ -56,11 +73,13 @@ export function snapshot() {
     entries: { ...metrics.entries },
     aggregate_path: { ...metrics.aggregatePath },
     aggregate_admission: { ...metrics.aggregateAdmission },
+    aggregate_keys: { ...metrics.aggregateKeys },
     latency_ms: {
       post: metrics.latency.post.percentiles(),
       get_logs: metrics.latency.getLogs.percentiles(),
       aggregate: metrics.latency.aggregate.percentiles(),
       aggregate_wait: metrics.latency.aggregateWait.percentiles(),
+      aggregate_exec: metrics.latency.aggregateExec.percentiles(),
     },
   };
 }

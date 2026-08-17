@@ -7,11 +7,11 @@
  */
 
 export type AggregateTracePath = 'rollup' | 'raw' | 'hybrid';
-export type AggregateSqlSource = 'rollup' | 'raw';
+export type AggregateSqlSource = 'state' | 'rollup' | 'raw' | 'hybrid';
 
 export interface AggregateSqlTrace {
   source: AggregateSqlSource;
-  range: { from: string; until: string };
+  range: { from: string; until: string } | null;
   connectionRequestedAt: number;
   connectionAcquiredAt?: number;
   sqlStartedAt?: number;
@@ -39,7 +39,7 @@ export interface AggregateRequestTrace {
   oldestRollupBucket?: string | null;
   newestRollupBucket?: string | null;
   rollupRange?: { from: string; until: string } | null;
-  rawRanges?: Array<{ from: string; until: string }>;
+  rawRanges?: Array<{ from: string; until: string; minId?: string }>;
   rawTailStart?: string | null;
   rawTailEnd?: string | null;
   rawRowsTouched: number;
@@ -102,12 +102,12 @@ export function finishAggregateTrace(trace: AggregateRequestTrace | null): void 
 export function beginAggregateSql(
   trace: AggregateRequestTrace | null,
   source: AggregateSqlSource,
-  range: { from: string; until: string }
+  range: { from: string; until: string } | null
 ): AggregateSqlTrace | null {
   if (trace === null) return null;
   const part: AggregateSqlTrace = {
     source,
-    range: { ...range },
+    range: range === null ? null : { ...range },
     connectionRequestedAt: performance.now(),
   };
   trace.sql.push(part);
@@ -125,21 +125,22 @@ function renderTrace(trace: AggregateRequestTrace) {
   const finished = allSql.flatMap((part) => (part.sqlFinishedAt === undefined ? [] : [part.sqlFinishedAt]));
   const firstSqlStarted = started.length === 0 ? undefined : Math.min(...started);
   const lastSqlFinished = finished.length === 0 ? undefined : Math.max(...finished);
-  const connectionWaitMs = allSql.reduce(
-    (sum, part) =>
-      sum +
-      (part.connectionAcquiredAt === undefined
-        ? 0
-        : part.connectionAcquiredAt - part.connectionRequestedAt),
-    0
+  // The two raw edge queries in a hybrid plan run concurrently. Unioning their
+  // intervals keeps this a wall-clock decomposition instead of double-counting
+  // overlapping connection waits or execution.
+  const connectionWaitMs = unionDuration(
+    allSql.flatMap((part) =>
+      part.connectionAcquiredAt === undefined
+        ? []
+        : [[part.connectionRequestedAt, part.connectionAcquiredAt] as const]
+    )
   );
-  const sqlExecutionMs = allSql.reduce(
-    (sum, part) =>
-      sum +
-      (part.sqlStartedAt === undefined || part.sqlFinishedAt === undefined
-        ? 0
-        : part.sqlFinishedAt - part.sqlStartedAt),
-    0
+  const sqlExecutionMs = unionDuration(
+    allSql.flatMap((part) =>
+      part.sqlStartedAt === undefined || part.sqlFinishedAt === undefined
+        ? []
+        : [[part.sqlStartedAt, part.sqlFinishedAt] as const]
+    )
   );
 
   return {
@@ -205,4 +206,23 @@ function duration(from: number | undefined, until: number | undefined): number |
 
 function rounded(value: number): number {
   return Number(value.toFixed(3));
+}
+
+function unionDuration(intervals: ReadonlyArray<readonly [number, number]>): number {
+  if (intervals.length === 0) return 0;
+  const ordered = [...intervals].sort((a, b) => a[0] - b[0]);
+  let start = ordered[0][0];
+  let end = ordered[0][1];
+  let total = 0;
+
+  for (const [nextStart, nextEnd] of ordered.slice(1)) {
+    if (nextStart <= end) {
+      end = Math.max(end, nextEnd);
+      continue;
+    }
+    total += end - start;
+    start = nextStart;
+    end = nextEnd;
+  }
+  return total + end - start;
 }

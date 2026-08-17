@@ -1,9 +1,8 @@
 import { sql, type SQL } from 'drizzle-orm';
 import { drizzle } from 'drizzle-orm/node-postgres';
-import { pool } from '../db/client.js';
+import { aggregatePool } from '../db/client.js';
 import { attributeCondition } from './attributeFilter.js';
 import { getRollupState } from './rollupState.js';
-import { acceptedFloorMs } from '../ingest/ingestFloor.js';
 import { metrics } from '../observability/metrics.js';
 import {
   beginAggregateSql,
@@ -69,6 +68,8 @@ export interface AggregateResult {
 interface TimeRange {
   from: string;
   until: string;
+  /** Raw rows in an aligned rollup range are restricted to unfolded IDs. */
+  minId?: string;
 }
 
 /**
@@ -98,21 +99,23 @@ export async function aggregateLogs(
   const plan = await planAggregate(filters, width, trace);
 
   let rows: AggregateBucket[];
+  let actualPath: AggregatePath;
   if (plan.rollup === null) {
     rows = await rawAggregate(filters, width, plan.raw, trace);
-  } else if (plan.raw.length === 0) {
-    rows = await rollupAggregate(filters, width, plan.rollup, trace);
+    actualPath = 'raw';
   } else {
-    // Hybrid. The two sources cover disjoint half-open time ranges that tile the
-    // request exactly, so a row is counted by one of them and never by both;
-    // merging is a straight addition per (bucket, group).
-    rows = mergeBuckets([
-      await rollupAggregate(filters, width, plan.rollup, trace),
-      ...(await Promise.all(plan.raw.map((range) => rawAggregate(filters, width, [range], trace)))),
-    ]);
+    const hybrid = await watermarkAggregate(filters, width, plan, trace);
+    rows = hybrid.rows;
+    actualPath =
+      hybrid.rollupRowsTouched > 0
+        ? hybrid.rawRowsTouched > 0
+          ? 'hybrid'
+          : 'rollup'
+        : 'raw';
   }
 
-  metrics.aggregatePath[plan.path]++;
+  metrics.aggregatePath[actualPath]++;
+  if (trace !== null) trace.path = actualPath;
 
   // Ascending by bucket start, then by group. `start` is rendered as a
   // zero-padded ISO 8601 UTC string, so lexicographic order is chronological
@@ -127,7 +130,7 @@ export async function aggregateLogs(
   });
   markAggregateTrace(trace, 'mergeFinished');
 
-  return { buckets: rows, path: plan.path };
+  return { buckets: rows, path: actualPath };
 }
 
 interface AggregatePlan {
@@ -175,14 +178,14 @@ async function planAggregate(
     return rawOnly;
   }
 
-  const state = await getRollupState();
+  const state = await getRollupState(trace);
   if (trace !== null) {
     trace.safeBefore = state.safeBefore?.toISOString() ?? null;
     trace.rollupWatermark = state.watermarkId;
     trace.oldestRollupBucket = state.oldestBucket?.toISOString() ?? null;
     trace.newestRollupBucket = state.newestBucket?.toISOString() ?? null;
   }
-  if (state.safeBefore === null) {
+  if (state.watermarkId === '0') {
     notePlan(trace, rawOnly);
     return rawOnly;
   }
@@ -205,23 +208,11 @@ async function planAggregate(
     return rawOnly;
   }
 
-  // The published boundary assumes logs are stamped near the time they are
-  // sent. A deliberately backdated entry breaks that assumption: it can land
-  // under a boundary the refresh has already moved past, and would then be
-  // absent from the rollup until the next fold. So the boundary is pulled down
-  // to the oldest timestamp this process has recently accepted, which puts that
-  // entry's minute back on the raw side where it is counted. In the steady
-  // state the floor is newer than the published boundary and this is a no-op.
-  const ingestFloor = acceptedFloorMs();
-  const boundary = Math.min(state.safeBefore.getTime(), floorBucket(ingestFloor, stored));
-  if (trace !== null) {
-    trace.ingestFloor = Number.isFinite(ingestFloor) ? new Date(ingestFloor).toISOString() : null;
-  }
-
-  // The rollup can serve [rollupFrom, rollupUntil): inside the request, below
-  // the refresh boundary, and on whole-minute edges at both ends.
+  // Whole stored buckets are read from the rollup for folded IDs and from raw
+  // for IDs at/above the watermark. The two sources are disjoint by ID, which
+  // remains exact even when refresh is behind or an entry is backdated.
   const rollupFrom = ceilBucket(since, filters.since, stored);
-  const rollupUntil = floorBucket(Math.min(until, boundary), stored);
+  const rollupUntil = floorBucket(until, stored);
 
   if (rollupFrom >= rollupUntil) {
     notePlan(trace, rawOnly);
@@ -229,13 +220,14 @@ async function planAggregate(
   }
 
   const raw: TimeRange[] = [];
-  // Leading partial minute: the request started mid-bucket.
+  // Partial stored buckets cannot use their whole rollup row, so all IDs in
+  // those fragments come from raw.
   if (since < rollupFrom) raw.push({ from: filters.since, until: isoUtc(rollupFrom) });
-  // The hot tail, plus any trailing partial minute.
+  raw.push({ from: isoUtc(rollupFrom), until: isoUtc(rollupUntil), minId: state.watermarkId });
   if (rollupUntil < until) raw.push({ from: isoUtc(rollupUntil), until: filters.until });
 
   const plan: AggregatePlan = {
-    path: raw.length === 0 ? 'rollup' : 'hybrid',
+    path: 'hybrid',
     rollup: { from: isoUtc(rollupFrom), until: isoUtc(rollupUntil) },
     raw,
   };
@@ -248,7 +240,7 @@ function notePlan(trace: AggregateRequestTrace | null, plan: AggregatePlan): voi
   trace.path = plan.path;
   trace.rollupRange = plan.rollup === null ? null : { ...plan.rollup };
   trace.rawRanges = plan.raw.map((range) => ({ ...range }));
-  const tail = plan.raw.at(-1);
+  const tail = plan.raw.find((range) => range.minId !== undefined) ?? plan.raw.at(-1);
   trace.rawTailStart = tail?.from ?? null;
   trace.rawTailEnd = tail?.until ?? null;
 }
@@ -336,9 +328,126 @@ async function rawAggregate(
 
   const touched = rows.reduce((sum, row) => sum + row.count, 0);
   if (trace !== null) trace.rawRowsTouched += touched;
-  const part = trace?.sql.at(-1);
-  if (part?.source === 'raw' && part.range.from === range.from) part.sourceRowsTouched = touched;
+  const part = trace?.sql.find(
+    (candidate) => candidate.source === 'raw' && candidate.range?.from === range.from
+  );
+  if (part !== undefined) part.sourceRowsTouched = touched;
   return rows;
+}
+
+interface WatermarkAggregateResult {
+  rows: AggregateBucket[];
+  rawRowsTouched: number;
+  rollupRowsTouched: number;
+}
+
+interface WatermarkBucketRow extends AggregateBucket {
+  raw_rows: number;
+  rollup_rows: number;
+}
+
+/**
+ * Combines folded and unfolded IDs inside one PostgreSQL statement.
+ *
+ * The statement snapshot is essential. A refresh updates log_rollups and its
+ * watermark in one transaction, so this query sees either both old values or
+ * both new values. Reading the watermark in one round trip and the rollup in a
+ * later one could straddle that commit and count the newly folded IDs twice.
+ */
+async function watermarkAggregate(
+  filters: AggregateFilters,
+  width: number,
+  plan: AggregatePlan,
+  trace: AggregateRequestTrace | null
+): Promise<WatermarkAggregateResult> {
+  if (plan.rollup === null) throw new Error('watermark aggregate requires a rollup range');
+
+  const rollupConditions = [
+    sql`bucket_start >= ${plan.rollup.from}::timestamptz`,
+    sql`bucket_start < ${plan.rollup.until}::timestamptz`,
+  ];
+  if (filters.service !== undefined) rollupConditions.push(sql`service = ${filters.service}`);
+  if (filters.level !== undefined) rollupConditions.push(sql`level = ${filters.level}`);
+
+  const rawRanges = plan.raw.map((range) => {
+    const conditions = [
+      sql`"timestamp" >= ${range.from}::timestamptz`,
+      sql`"timestamp" < ${range.until}::timestamptz`,
+    ];
+    if (range.minId !== undefined) {
+      conditions.push(sql`id >= (SELECT watermark_id FROM watermark)`);
+    }
+    return sql`(${sql.join(conditions, sql` AND `)})`;
+  });
+
+  const rawConditions: SQL[] = [sql`(${sql.join(rawRanges, sql` OR `)})`];
+  if (filters.service !== undefined) rawConditions.push(sql`service = ${filters.service}`);
+  if (filters.level !== undefined) rawConditions.push(sql`level = ${filters.level}`);
+
+  const rollupBucket = sql`date_bin(make_interval(secs => ${width}), bucket_start, TIMESTAMPTZ 'epoch')`;
+  const rawBucket = sql`date_bin(make_interval(secs => ${width}), "timestamp", TIMESTAMPTZ 'epoch')`;
+  const groupColumn: SQL =
+    filters.groupBy !== undefined ? sql.raw(GROUP_BY_COLUMNS[filters.groupBy]) : sql`NULL::text`;
+
+  const rows = await executeAggregate<WatermarkBucketRow>(sql`
+    WITH watermark AS MATERIALIZED (
+      SELECT watermark_id FROM rollup_state WHERE id
+    ),
+    rollup_source AS (
+      SELECT ${rollupBucket} AS bucket,
+             ${groupColumn} AS grp,
+             sum(entry_count)::bigint AS entries,
+             count(*)::bigint AS rollup_rows,
+             0::bigint AS raw_rows
+      FROM log_rollups
+      WHERE ${sql.join(rollupConditions, sql` AND `)}
+      GROUP BY 1, 2
+    ),
+    raw_source AS (
+      SELECT ${rawBucket} AS bucket,
+             ${groupColumn} AS grp,
+             count(*)::bigint AS entries,
+             0::bigint AS rollup_rows,
+             count(*)::bigint AS raw_rows
+      FROM logs
+      WHERE ${sql.join(rawConditions, sql` AND `)}
+      GROUP BY 1, 2
+    ),
+    aggregated AS (
+      SELECT bucket,
+             grp,
+             sum(entries)::bigint AS entries,
+             sum(rollup_rows)::bigint AS rollup_rows,
+             sum(raw_rows)::bigint AS raw_rows
+      FROM (
+        SELECT * FROM rollup_source
+        UNION ALL
+        SELECT * FROM raw_source
+      ) sources
+      GROUP BY 1, 2
+    )
+    SELECT to_char(bucket AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS start,
+           grp AS group,
+           entries AS count,
+           rollup_rows,
+           raw_rows
+    FROM aggregated
+  `, trace, 'hybrid', plan.rollup);
+
+  const rawRowsTouched = rows.reduce((sum, row) => sum + row.raw_rows, 0);
+  const rollupRowsTouched = rows.reduce((sum, row) => sum + row.rollup_rows, 0);
+  if (trace !== null) {
+    trace.rawRowsTouched += rawRowsTouched;
+    trace.rollupRowsTouched += rollupRowsTouched;
+  }
+  const part = trace?.sql.find((candidate) => candidate.source === 'hybrid');
+  if (part !== undefined) part.sourceRowsTouched = rawRowsTouched + rollupRowsTouched;
+
+  return {
+    rows: rows.map(({ raw_rows: _rawRows, rollup_rows: _rollupRows, ...row }) => row),
+    rawRowsTouched,
+    rollupRowsTouched,
+  };
 }
 
 /**
@@ -401,8 +510,10 @@ async function rollupAggregate(
 
   const touched = rows.reduce((sum, row) => sum + row.source_rows, 0);
   if (trace !== null) trace.rollupRowsTouched += touched;
-  const part = trace?.sql.at(-1);
-  if (part?.source === 'rollup' && part.range.from === range.from) part.sourceRowsTouched = touched;
+  const part = trace?.sql.find(
+    (candidate) => candidate.source === 'rollup' && candidate.range?.from === range.from
+  );
+  if (part !== undefined) part.sourceRowsTouched = touched;
   return rows.map(({ source_rows: _sourceRows, ...row }) => row);
 }
 
@@ -413,7 +524,7 @@ async function executeAggregate<T extends Record<string, unknown>>(
   range: TimeRange
 ): Promise<T[]> {
   const part = beginAggregateSql(trace, source, range);
-  const client = await pool.connect();
+  const client = await aggregatePool.connect();
   if (part !== null) part.connectionAcquiredAt = performance.now();
 
   try {

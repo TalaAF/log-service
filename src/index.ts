@@ -1,5 +1,5 @@
 import Fastify from 'fastify';
-import { pool, writePool } from './db/client.js';
+import { aggregatePool, pool, writePool } from './db/client.js';
 import { runMigrations } from './db/migrate.js';
 import { drain } from './ingest/writeBuffer.js';
 import { registerHealthRoute } from './routes/health.js';
@@ -67,7 +67,7 @@ function installShutdownHandlers() {
         } catch (err) {
           app.log.error(err);
         } finally {
-          await Promise.allSettled([pool.end(), writePool.end()]);
+          await Promise.allSettled([pool.end(), aggregatePool.end(), writePool.end()]);
           process.exit(0);
         }
       })();

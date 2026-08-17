@@ -151,6 +151,9 @@ services:
       FLUSH_MAX_ROWS: "20000"
       FLUSH_CONCURRENCY: "3"
       DB_POOL_MAX: "8"
+      # Reserved from DB_POOL_MAX for aggregate/state SQL; total read
+      # connections remain eight (seven general + one aggregate).
+      AGGREGATE_DB_POOL_MAX: "1"
       DB_WRITE_POOL_MAX: "4"
       LOG_LEVEL: "warn"
       # Rollups. LAG is how far behind now() the rollup/raw boundary sits: it

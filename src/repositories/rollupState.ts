@@ -1,5 +1,10 @@
 import { sql } from 'drizzle-orm';
-import { db } from '../db/client.js';
+import { drizzle } from 'drizzle-orm/node-postgres';
+import { aggregatePool } from '../db/client.js';
+import {
+  beginAggregateSql,
+  type AggregateRequestTrace,
+} from '../observability/aggregateTrace.js';
 
 /**
  * The refresh job's published position, as the query path sees it.
@@ -80,25 +85,42 @@ const UNAVAILABLE: RollupState = {
   newestBucket: null,
 };
 
-async function read(): Promise<RollupState> {
-  const result = await db.execute<StateRow>(sql`
-    SELECT rs.safe_before,
-           rc.bucket_seconds,
-           rs.watermark_id::text AS watermark_id,
-           rs.last_refresh_at,
-           rs.last_rows,
-           rs.last_duration_ms,
-           rs.refreshes,
-           rs.skipped,
-           rs.behind,
-           (SELECT min(bucket_start) FROM log_rollups) AS oldest_bucket,
-           (SELECT max(bucket_start) FROM log_rollups) AS newest_bucket
-    FROM rollup_state rs
-    CROSS JOIN rollup_config rc
-    WHERE rs.id AND rc.id
-  `);
+async function read(trace: AggregateRequestTrace | null): Promise<RollupState> {
+  const part = beginAggregateSql(trace, 'state', null);
+  const client = await aggregatePool.connect();
+  if (part !== null) part.connectionAcquiredAt = performance.now();
 
-  const row = result.rows[0];
+  let rows: StateRow[];
+  try {
+    if (part !== null) part.sqlStartedAt = performance.now();
+    const result = await drizzle(client).execute<StateRow>(sql`
+      SELECT rs.safe_before,
+             rc.bucket_seconds,
+             rs.watermark_id::text AS watermark_id,
+             rs.last_refresh_at,
+             rs.last_rows,
+             rs.last_duration_ms,
+             rs.refreshes,
+             rs.skipped,
+             rs.behind,
+             (SELECT min(bucket_start) FROM log_rollups) AS oldest_bucket,
+             (SELECT max(bucket_start) FROM log_rollups) AS newest_bucket
+      FROM rollup_state rs
+      CROSS JOIN rollup_config rc
+      WHERE rs.id AND rc.id
+    `);
+    rows = result.rows as StateRow[];
+    if (part !== null) {
+      part.sqlFinishedAt = performance.now();
+      part.returnedRows = rows.length;
+      part.sourceRowsTouched = rows.length;
+    }
+  } finally {
+    if (part !== null && part.sqlFinishedAt === undefined) part.sqlFinishedAt = performance.now();
+    client.release();
+  }
+
+  const row = rows[0];
   if (row === undefined) return UNAVAILABLE;
 
   return {
@@ -125,12 +147,12 @@ async function read(): Promise<RollupState> {
  * still returns the right answer, so a problem with the rollup machinery can
  * never turn into a wrong result or a 5xx.
  */
-export async function getRollupState(): Promise<RollupState> {
+export async function getRollupState(trace: AggregateRequestTrace | null = null): Promise<RollupState> {
   const now = Date.now();
   if (cached !== null && now - cached.readAt < STATE_TTL_MS) return cached.value;
   if (inFlight !== null) return inFlight;
 
-  inFlight = read()
+  inFlight = read(trace)
     .then((value) => {
       cached = { value, readAt: Date.now() };
       return value;

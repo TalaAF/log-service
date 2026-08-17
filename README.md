@@ -450,7 +450,7 @@ part of it and its stored count would otherwise include rows that are gone.
 | `INGEST_FLOOR_WINDOW_SECONDS` | 12 | How long an accepted batch holds the boundary below its oldest entry |
 | `AGGREGATE_CONCURRENCY` | 2 | Bounded (rollup/hybrid) aggregates at once |
 | `AGGREGATE_SCAN_CONCURRENCY` | 1 | Unbounded (`q`/`attr.*`) aggregates at once |
-| `DB_POOL_MAX` / `DB_WRITE_POOL_MAX` | 8 / 4 | Read and write pools, kept separate so ingest bursts cannot starve queries |
+| `DB_POOL_MAX` / `AGGREGATE_DB_POOL_MAX` / `DB_WRITE_POOL_MAX` | 8 / 1 / 4 | Total read connections / aggregate-reserved share / write connections |
 
 `INGEST_FLOOR_WINDOW_SECONDS` has a floor of its own: it must exceed the refresh
 interval (5s) plus the app's rollup-state cache (1s), so a batch is never

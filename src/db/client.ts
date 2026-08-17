@@ -23,9 +23,28 @@ function intFromEnv(name: string, fallback: number): number {
  * both pools are deliberately small: more concurrent backends than cores buys
  * context switching and lock contention, not throughput.
  */
+const totalReadConnections = intFromEnv('DB_POOL_MAX', 8);
+const requestedAggregateConnections = intFromEnv('AGGREGATE_DB_POOL_MAX', 1);
+const aggregateConnections = Math.min(requestedAggregateConnections, Math.max(1, totalReadConnections - 1));
+
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  max: intFromEnv('DB_POOL_MAX', 8),
+  max: Math.max(1, totalReadConnections - aggregateConnections),
+  idleTimeoutMillis: 30_000,
+});
+
+/**
+ * Reserved out of DB_POOL_MAX, not added on top of it.
+ *
+ * GET /logs can legitimately hold every general read client while searching
+ * for a read-after-write marker. If aggregates share that pool, a 2 ms rollup
+ * query can spend tens of seconds waiting to start. A small dedicated pool
+ * gives aggregate/state SQL an execution opportunity while keeping the total
+ * number of PostgreSQL read backends exactly the same.
+ */
+const aggregatePool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  max: aggregateConnections,
   idleTimeoutMillis: 30_000,
 });
 
@@ -37,11 +56,11 @@ const writePool = new Pool({
 
 // An idle-client error (server restart, network drop) is emitted on the pool
 // and would otherwise be an unhandled 'error' event and kill the process.
-for (const p of [pool, writePool]) {
+for (const p of [pool, aggregatePool, writePool]) {
   p.on('error', (err) => {
     console.error('[pg] idle client error:', err.message);
   });
 }
 
 export const db = drizzle(pool, { schema });
-export { pool, writePool };
+export { pool, aggregatePool, writePool };

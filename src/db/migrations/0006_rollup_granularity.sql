@@ -83,7 +83,8 @@ DECLARE
     seq_last     BIGINT;
     candidate    BIGINT;
     taken_at     TIMESTAMPTZ;
-    settle_xmax  XID8;
+    settle_snapshot PG_SNAPSHOT;
+    in_flight_xids XID8[];
     settled      BOOLEAN := FALSE;
     caught_up    BOOLEAN;
     folded       BIGINT := 0;
@@ -117,12 +118,24 @@ BEGIN
 
     -- A sequence hands out ids before the transaction that took them commits,
     -- so seq_last can sit above ids belonging to a COPY still in flight.
-    -- Waiting until the current snapshot's xmin has passed the xmax recorded
-    -- just now proves every transaction that could hold such an id has since
-    -- committed or aborted. See 0005 for the full reasoning.
-    settle_xmax := pg_snapshot_xmax(pg_current_snapshot());
-    FOR attempt IN 1..50 LOOP
-        IF pg_snapshot_xmin(pg_current_snapshot()) >= settle_xmax THEN
+    -- Capture the exact transactions that were in flight when seq_last was
+    -- read, then wait for those XIDs to finish. Re-reading
+    -- pg_current_snapshot() inside this function does not work: the function is
+    -- one top-level statement, so its transaction snapshot does not advance and
+    -- a run that initially sees a COPY can only time out and skip. Transactions
+    -- that start after this snapshot can only allocate ids above seq_last and
+    -- therefore do not need to delay this fold.
+    settle_snapshot := pg_current_snapshot();
+    SELECT COALESCE(array_agg(active_xid), ARRAY[]::XID8[])
+    INTO in_flight_xids
+    FROM pg_snapshot_xip(settle_snapshot) AS active(active_xid);
+
+    FOR attempt IN 1..500 LOOP
+        IF NOT EXISTS (
+            SELECT 1
+            FROM unnest(in_flight_xids) AS active(active_xid)
+            WHERE pg_xact_status(active_xid) = 'in progress'
+        ) THEN
             settled := TRUE;
             EXIT;
         END IF;

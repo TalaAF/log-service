@@ -1,6 +1,6 @@
 import type { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
 import { sql } from 'drizzle-orm';
-import { db, pool, writePool } from '../db/client.js';
+import { aggregatePool, db, pool, writePool } from '../db/client.js';
 import { snapshot } from '../observability/metrics.js';
 import { gateStats } from '../observability/aggregateGate.js';
 import { bufferStats } from '../ingest/writeBuffer.js';
@@ -68,6 +68,11 @@ async function handleGetStats(request: FastifyRequest, reply: FastifyReply) {
     },
     pools: {
       read: { total: pool.totalCount, idle: pool.idleCount, waiting: pool.waitingCount },
+      aggregate: {
+        total: aggregatePool.totalCount,
+        idle: aggregatePool.idleCount,
+        waiting: aggregatePool.waitingCount,
+      },
       write: { total: writePool.totalCount, idle: writePool.idleCount, waiting: writePool.waitingCount },
     },
     aggregate_traces: aggregateTraceSnapshot(),

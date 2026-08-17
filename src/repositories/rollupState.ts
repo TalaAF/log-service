@@ -9,11 +9,10 @@ import {
 /**
  * The refresh job's published position, as the query path sees it.
  *
- * `safeBefore` is the boundary between the two sources: every raw row with a
- * timestamp below it is already counted in `log_rollups`, so that side of the
- * boundary can be answered from the rollup and the other side has to come from
- * the raw table. It is always aligned to a whole minute, which is the rollup's
- * bucket width, so no bucket is ever split between the two.
+ * `watermarkId` is the exact fold boundary. Aggregate SQL reads it together
+ * with the rollup and raw rows in one statement snapshot, so folded and
+ * unfolded IDs are disjoint during concurrent refreshes. `safeBefore` remains
+ * useful as refresh-progress telemetry, but is not a correctness boundary.
  */
 export interface RollupState {
   safeBefore: Date | null;
@@ -46,11 +45,10 @@ interface CachedState {
  * query rate those round trips are backend wakeups on a CPU that has none to
  * spare.
  *
- * Caching it is safe in one direction only, and this is that direction:
- * `safe_before` only ever moves forwards, so a cached copy is at worst *older*
- * than the truth. An older boundary means more of the range is answered from
- * raw rows — slower, never wrong. A cache that could run ahead of the refresh
- * job would be a correctness bug; this one cannot.
+ * The cached state is used to choose whether a rollup exists and to construct
+ * an inexpensive plan. The aggregate statement re-reads `watermark_id` in its
+ * own snapshot before combining sources, so a stale cache can affect routing
+ * or trace metadata but cannot double-count or omit rows.
  */
 const STATE_TTL_MS = Number(process.env.ROLLUP_STATE_TTL_MS) || 1000;
 

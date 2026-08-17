@@ -52,7 +52,7 @@ export type AggregatePath = 'rollup' | 'raw' | 'hybrid';
  * `scan` means the rollup cannot contribute at all, so the whole requested
  * range is read from raw rows and the cost is unbounded — it grows with however
  * much history the caller asked for. Everything else is bounded by the refresh
- * boundary. The distinction is exactly the filters the rollup cannot represent,
+ * watermark. The distinction is exactly the filters the rollup cannot represent,
  * so it is derived from them rather than guessed at from the range.
  */
 export function aggregateCost(filters: AggregateFilters): 'bounded' | 'scan' {
@@ -137,7 +137,7 @@ interface AggregatePlan {
   path: AggregatePath;
   /** Range answered from log_rollups, or null when the rollup cannot be used. */
   rollup: TimeRange | null;
-  /** Ranges answered from the raw table. Disjoint from `rollup` and from each other. */
+  /** Raw ranges; aligned overlap is made disjoint from `rollup` by `minId`. */
   raw: TimeRange[];
 }
 
@@ -149,14 +149,13 @@ interface AggregatePlan {
  *   1. the filters only reference columns the rollup carries;
  *   2. the requested bucket is a whole multiple of the stored minute, so larger
  *      buckets can be derived by summing minutes;
- *   3. the sub-range is *both* below the refresh boundary and aligned to whole
- *      minutes — a partial minute cannot be taken from a row that counts the
- *      whole minute.
+ *   3. the sub-range is aligned to whole stored buckets — a partial stored
+ *      bucket cannot use a row that counts the whole bucket.
  *
- * Whatever is left over is read from the raw table. In the steady state that
- * leftover is the newest minute or two, whose size depends on the ingest rate
- * and not at all on how much history has accumulated. That is the property that
- * matters: the cost of this endpoint stops growing with the table.
+ * Whole buckets use rollups for IDs below the refresh watermark and raw rows
+ * at or above it. Partial edge buckets stay entirely raw. The database reads
+ * the watermark and both sources in one statement snapshot, making the sources
+ * disjoint even if a refresh commits concurrently.
  */
 async function planAggregate(
   filters: AggregateFilters,

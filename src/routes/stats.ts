@@ -5,6 +5,7 @@ import { snapshot } from '../observability/metrics.js';
 import { gateStats } from '../observability/aggregateGate.js';
 import { bufferStats } from '../ingest/writeBuffer.js';
 import { getRollupState } from '../repositories/rollupState.js';
+import { aggregateTraceSnapshot } from '../observability/aggregateTrace.js';
 
 /**
  * Diagnostics, outside the four endpoints of the contract.
@@ -69,6 +70,7 @@ async function handleGetStats(request: FastifyRequest, reply: FastifyReply) {
       read: { total: pool.totalCount, idle: pool.idleCount, waiting: pool.waitingCount },
       write: { total: writePool.totalCount, idle: writePool.idleCount, waiting: writePool.waitingCount },
     },
+    aggregate_traces: aggregateTraceSnapshot(),
     db: dbStats ?? null,
   });
 }

@@ -95,10 +95,15 @@ function release(lane: Lane): void {
  * never be answered from a view of the data older than the moment it started
  * running. Queueing changes when a request is served, never what it sees.
  */
-export async function withAggregateSlot<T>(cost: AggregateCost, work: () => Promise<T>): Promise<T> {
+export async function withAggregateSlot<T>(
+  cost: AggregateCost,
+  work: () => Promise<T>,
+  onAcquired?: () => void
+): Promise<T> {
   const lane = lanes[cost];
   const waitStart = performance.now();
   await acquire(lane);
+  onAcquired?.();
   metrics.latency.aggregateWait.record(performance.now() - waitStart);
 
   try {

@@ -8,6 +8,11 @@ import {
 } from '../repositories/aggregateRepository.js';
 import { withAggregateSlot } from '../observability/aggregateGate.js';
 import { metrics } from '../observability/metrics.js';
+import {
+  beginAggregateTrace,
+  finishAggregateTrace,
+  markAggregateTrace,
+} from '../observability/aggregateTrace.js';
 
 const LEVELS = ['debug', 'info', 'warn', 'error'];
 const ATTR_PREFIX = 'attr.';
@@ -17,9 +22,24 @@ export function registerAggregateRoute(app: FastifyInstance) {
 }
 
 async function handleGetAggregate(request: FastifyRequest, reply: FastifyReply) {
-  const parsed = parseAggregateQuery(request.query as Record<string, unknown>);
+  const query = request.query as Record<string, unknown>;
+  const trace = beginAggregateTrace(request.url, {
+    since: singleValue(query.since),
+    until: singleValue(query.until),
+    bucket: singleValue(query.bucket),
+    groupBy: singleValue(query.group_by),
+  });
+  reply.raw.once('finish', () => finishAggregateTrace(trace));
+
+  const parsed = parseAggregateQuery(query);
   if (!parsed.valid) {
+    if (trace !== null) trace.validationError = parsed.error;
     return reply.status(400).send({ error: parsed.error });
+  }
+
+  if (trace !== null) {
+    trace.resolvedSince = parsed.filters.since;
+    trace.resolvedUntil = parsed.filters.until;
   }
 
   metrics.requests.aggregate++;
@@ -35,16 +55,20 @@ async function handleGetAggregate(request: FastifyRequest, reply: FastifyReply) 
   // unbounded scan just because both are aggregates.
   // Execution is timed inside the slot so queue wait and database work are two
   // independent measurements rather than one derived by subtracting the other.
-  const { buckets } = await withAggregateSlot(aggregateCost(parsed.filters), () =>
-    (async () => {
-      const execStart = performance.now();
-      try {
-        return await aggregateLogs(parsed.filters);
-      } finally {
-        metrics.latency.aggregateExec.record(performance.now() - execStart);
-        releaseKey();
-      }
-    })()
+  markAggregateTrace(trace, 'admissionQueueEntered');
+  const { buckets } = await withAggregateSlot(
+    aggregateCost(parsed.filters),
+    () =>
+      (async () => {
+        const execStart = performance.now();
+        try {
+          return await aggregateLogs(parsed.filters, trace);
+        } finally {
+          metrics.latency.aggregateExec.record(performance.now() - execStart);
+          releaseKey();
+        }
+      })(),
+    () => markAggregateTrace(trace, 'admissionSlotAcquired')
   );
 
   metrics.latency.aggregate.record(performance.now() - started);

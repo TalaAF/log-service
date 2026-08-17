@@ -1,9 +1,16 @@
 import { sql, type SQL } from 'drizzle-orm';
-import { db } from '../db/client.js';
+import { drizzle } from 'drizzle-orm/node-postgres';
+import { pool } from '../db/client.js';
 import { attributeCondition } from './attributeFilter.js';
 import { getRollupState } from './rollupState.js';
 import { acceptedFloorMs } from '../ingest/ingestFloor.js';
 import { metrics } from '../observability/metrics.js';
+import {
+  beginAggregateSql,
+  markAggregateTrace,
+  type AggregateRequestTrace,
+  type AggregateSqlSource,
+} from '../observability/aggregateTrace.js';
 
 /** Bucket sizes the API accepts, mapped to their width in seconds. */
 export const BUCKET_SECONDS: Record<string, number> = {
@@ -79,26 +86,29 @@ interface TimeRange {
  * raw path is not a fallback in the sense of being second best; it is the only
  * correct answer for those queries, and it stays exactly as it was.
  */
-export async function aggregateLogs(filters: AggregateFilters): Promise<AggregateResult> {
+export async function aggregateLogs(
+  filters: AggregateFilters,
+  trace: AggregateRequestTrace | null = null
+): Promise<AggregateResult> {
   const width = BUCKET_SECONDS[filters.bucket];
   if (width === undefined) {
     throw new Error(`unsupported bucket size: ${filters.bucket}`);
   }
 
-  const plan = await planAggregate(filters, width);
+  const plan = await planAggregate(filters, width, trace);
 
   let rows: AggregateBucket[];
   if (plan.rollup === null) {
-    rows = await rawAggregate(filters, width, plan.raw);
+    rows = await rawAggregate(filters, width, plan.raw, trace);
   } else if (plan.raw.length === 0) {
-    rows = await rollupAggregate(filters, width, plan.rollup);
+    rows = await rollupAggregate(filters, width, plan.rollup, trace);
   } else {
     // Hybrid. The two sources cover disjoint half-open time ranges that tile the
     // request exactly, so a row is counted by one of them and never by both;
     // merging is a straight addition per (bucket, group).
     rows = mergeBuckets([
-      await rollupAggregate(filters, width, plan.rollup),
-      ...(await Promise.all(plan.raw.map((range) => rawAggregate(filters, width, [range])))),
+      await rollupAggregate(filters, width, plan.rollup, trace),
+      ...(await Promise.all(plan.raw.map((range) => rawAggregate(filters, width, [range], trace)))),
     ]);
   }
 
@@ -115,6 +125,7 @@ export async function aggregateLogs(filters: AggregateFilters): Promise<Aggregat
     if (left === right) return 0;
     return left < right ? -1 : 1;
   });
+  markAggregateTrace(trace, 'mergeFinished');
 
   return { buckets: rows, path: plan.path };
 }
@@ -144,18 +155,37 @@ interface AggregatePlan {
  * and not at all on how much history has accumulated. That is the property that
  * matters: the cost of this endpoint stops growing with the table.
  */
-async function planAggregate(filters: AggregateFilters, width: number): Promise<AggregatePlan> {
+async function planAggregate(
+  filters: AggregateFilters,
+  width: number,
+  trace: AggregateRequestTrace | null
+): Promise<AggregatePlan> {
   const wholeRange: TimeRange[] = [{ from: filters.since, until: filters.until }];
   const rawOnly: AggregatePlan = { path: 'raw', rollup: null, raw: wholeRange };
 
   // `q` matches `message` and `attr.*` matches `attributes`; the rollup carries
   // neither, and approximating either one would be a wrong answer rather than a
   // slower one.
-  if (filters.q !== undefined) return rawOnly;
-  if (filters.attributes !== undefined) return rawOnly;
+  if (filters.q !== undefined) {
+    notePlan(trace, rawOnly);
+    return rawOnly;
+  }
+  if (filters.attributes !== undefined) {
+    notePlan(trace, rawOnly);
+    return rawOnly;
+  }
 
   const state = await getRollupState();
-  if (state.safeBefore === null) return rawOnly;
+  if (trace !== null) {
+    trace.safeBefore = state.safeBefore?.toISOString() ?? null;
+    trace.rollupWatermark = state.watermarkId;
+    trace.oldestRollupBucket = state.oldestBucket?.toISOString() ?? null;
+    trace.newestRollupBucket = state.newestBucket?.toISOString() ?? null;
+  }
+  if (state.safeBefore === null) {
+    notePlan(trace, rawOnly);
+    return rawOnly;
+  }
 
   // A requested bucket that is not a whole multiple of the stored width cannot
   // be assembled from stored rows -- the edges would not line up and the sum
@@ -163,11 +193,17 @@ async function planAggregate(filters: AggregateFilters, width: number): Promise<
   // ten seconds; the check is here so that changing either one degrades to the
   // raw path instead of quietly returning wrong counts.
   const stored = state.bucketSeconds;
-  if (stored <= 0 || width < stored || width % stored !== 0) return rawOnly;
+  if (stored <= 0 || width < stored || width % stored !== 0) {
+    notePlan(trace, rawOnly);
+    return rawOnly;
+  }
 
   const since = Date.parse(filters.since);
   const until = Date.parse(filters.until);
-  if (Number.isNaN(since) || Number.isNaN(until)) return rawOnly;
+  if (Number.isNaN(since) || Number.isNaN(until)) {
+    notePlan(trace, rawOnly);
+    return rawOnly;
+  }
 
   // The published boundary assumes logs are stamped near the time they are
   // sent. A deliberately backdated entry breaks that assumption: it can land
@@ -176,14 +212,21 @@ async function planAggregate(filters: AggregateFilters, width: number): Promise<
   // to the oldest timestamp this process has recently accepted, which puts that
   // entry's minute back on the raw side where it is counted. In the steady
   // state the floor is newer than the published boundary and this is a no-op.
-  const boundary = Math.min(state.safeBefore.getTime(), floorBucket(acceptedFloorMs(), stored));
+  const ingestFloor = acceptedFloorMs();
+  const boundary = Math.min(state.safeBefore.getTime(), floorBucket(ingestFloor, stored));
+  if (trace !== null) {
+    trace.ingestFloor = Number.isFinite(ingestFloor) ? new Date(ingestFloor).toISOString() : null;
+  }
 
   // The rollup can serve [rollupFrom, rollupUntil): inside the request, below
   // the refresh boundary, and on whole-minute edges at both ends.
   const rollupFrom = ceilBucket(since, filters.since, stored);
   const rollupUntil = floorBucket(Math.min(until, boundary), stored);
 
-  if (rollupFrom >= rollupUntil) return rawOnly;
+  if (rollupFrom >= rollupUntil) {
+    notePlan(trace, rawOnly);
+    return rawOnly;
+  }
 
   const raw: TimeRange[] = [];
   // Leading partial minute: the request started mid-bucket.
@@ -191,11 +234,23 @@ async function planAggregate(filters: AggregateFilters, width: number): Promise<
   // The hot tail, plus any trailing partial minute.
   if (rollupUntil < until) raw.push({ from: isoUtc(rollupUntil), until: filters.until });
 
-  return {
+  const plan: AggregatePlan = {
     path: raw.length === 0 ? 'rollup' : 'hybrid',
     rollup: { from: isoUtc(rollupFrom), until: isoUtc(rollupUntil) },
     raw,
   };
+  notePlan(trace, plan);
+  return plan;
+}
+
+function notePlan(trace: AggregateRequestTrace | null, plan: AggregatePlan): void {
+  if (trace === null) return;
+  trace.path = plan.path;
+  trace.rollupRange = plan.rollup === null ? null : { ...plan.rollup };
+  trace.rawRanges = plan.raw.map((range) => ({ ...range }));
+  const tail = plan.raw.at(-1);
+  trace.rawTailStart = tail?.from ?? null;
+  trace.rawTailEnd = tail?.until ?? null;
 }
 
 /**
@@ -209,7 +264,8 @@ async function planAggregate(filters: AggregateFilters, width: number): Promise<
 async function rawAggregate(
   filters: AggregateFilters,
   width: number,
-  ranges: TimeRange[]
+  ranges: TimeRange[],
+  trace: AggregateRequestTrace | null
 ): Promise<AggregateBucket[]> {
   if (ranges.length === 0) return [];
   const range = ranges[0];
@@ -264,7 +320,7 @@ async function rawAggregate(
   // HashAggregate over the same scan — 6.2MB in memory, 515ms — because the
   // grouping no longer has to produce ordered output. The caller sorts the
   // aggregated rows instead, of which there are only buckets x groups.
-  const result = await db.execute<AggregateBucket>(sql`
+  const rows = await executeAggregate<AggregateBucket>(sql`
     SELECT to_char(bucket_start AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS start,
            grp AS group,
            entries AS count
@@ -276,9 +332,13 @@ async function rawAggregate(
       WHERE ${whereClause}
       GROUP BY 1, 2
     ) aggregated
-  `);
+  `, trace, 'raw', range);
 
-  return result.rows;
+  const touched = rows.reduce((sum, row) => sum + row.count, 0);
+  if (trace !== null) trace.rawRowsTouched += touched;
+  const part = trace?.sql.at(-1);
+  if (part?.source === 'raw' && part.range.from === range.from) part.sourceRowsTouched = touched;
+  return rows;
 }
 
 /**
@@ -295,7 +355,8 @@ async function rawAggregate(
 async function rollupAggregate(
   filters: AggregateFilters,
   width: number,
-  range: TimeRange
+  range: TimeRange,
+  trace: AggregateRequestTrace | null
 ): Promise<AggregateBucket[]> {
   const conditions = [
     sql`bucket_start >= ${range.from}::timestamptz`,
@@ -322,21 +383,52 @@ async function rollupAggregate(
   // sum() over bigint returns numeric, which node-postgres hands back as a
   // string to protect precision; the contract requires `count` to be a JSON
   // number, so it is narrowed back to bigint and parsed by the int8 handler.
-  const result = await db.execute<AggregateBucket>(sql`
+  const rows = await executeAggregate<AggregateBucket & { source_rows: number }>(sql`
     SELECT to_char(bucket AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS start,
            grp AS group,
-           entries AS count
+           entries AS count,
+           source_rows
     FROM (
       SELECT ${bucketStart} AS bucket,
              ${groupColumn} AS grp,
-             sum(entry_count)::bigint AS entries
+             sum(entry_count)::bigint AS entries,
+             count(*)::bigint AS source_rows
       FROM log_rollups
       WHERE ${whereClause}
       GROUP BY 1, 2
     ) aggregated
-  `);
+  `, trace, 'rollup', range);
 
-  return result.rows;
+  const touched = rows.reduce((sum, row) => sum + row.source_rows, 0);
+  if (trace !== null) trace.rollupRowsTouched += touched;
+  const part = trace?.sql.at(-1);
+  if (part?.source === 'rollup' && part.range.from === range.from) part.sourceRowsTouched = touched;
+  return rows.map(({ source_rows: _sourceRows, ...row }) => row);
+}
+
+async function executeAggregate<T extends Record<string, unknown>>(
+  statement: SQL,
+  trace: AggregateRequestTrace | null,
+  source: AggregateSqlSource,
+  range: TimeRange
+): Promise<T[]> {
+  const part = beginAggregateSql(trace, source, range);
+  const client = await pool.connect();
+  if (part !== null) part.connectionAcquiredAt = performance.now();
+
+  try {
+    const scopedDb = drizzle(client);
+    if (part !== null) part.sqlStartedAt = performance.now();
+    const result = await scopedDb.execute<T>(statement);
+    if (part !== null) {
+      part.sqlFinishedAt = performance.now();
+      part.returnedRows = result.rows.length;
+    }
+    return result.rows as T[];
+  } finally {
+    if (part !== null && part.sqlFinishedAt === undefined) part.sqlFinishedAt = performance.now();
+    client.release();
+  }
 }
 
 /** Adds up counts for the same (bucket, group) across sources. */

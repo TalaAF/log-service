@@ -26,6 +26,8 @@ export interface RollupState {
   refreshes: number;
   skipped: number;
   behind: boolean;
+  oldestBucket: Date | null;
+  newestBucket: Date | null;
 }
 
 interface CachedState {
@@ -60,6 +62,8 @@ interface StateRow extends Record<string, unknown> {
   refreshes: number;
   skipped: number;
   behind: boolean;
+  oldest_bucket: Date | string | null;
+  newest_bucket: Date | string | null;
 }
 
 const UNAVAILABLE: RollupState = {
@@ -72,6 +76,8 @@ const UNAVAILABLE: RollupState = {
   refreshes: 0,
   skipped: 0,
   behind: false,
+  oldestBucket: null,
+  newestBucket: null,
 };
 
 async function read(): Promise<RollupState> {
@@ -84,7 +90,9 @@ async function read(): Promise<RollupState> {
            rs.last_duration_ms,
            rs.refreshes,
            rs.skipped,
-           rs.behind
+           rs.behind,
+           (SELECT min(bucket_start) FROM log_rollups) AS oldest_bucket,
+           (SELECT max(bucket_start) FROM log_rollups) AS newest_bucket
     FROM rollup_state rs
     CROSS JOIN rollup_config rc
     WHERE rs.id AND rc.id
@@ -103,6 +111,8 @@ async function read(): Promise<RollupState> {
     refreshes: Number(row.refreshes),
     skipped: Number(row.skipped),
     behind: row.behind,
+    oldestBucket: row.oldest_bucket === null ? null : new Date(row.oldest_bucket),
+    newestBucket: row.newest_bucket === null ? null : new Date(row.newest_bucket),
   };
 }
 

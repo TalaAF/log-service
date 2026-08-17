@@ -37,9 +37,9 @@ function intFromEnv(name: string, fallback: number): number {
 /**
  * How long an accepted batch keeps holding the boundary down.
  *
- * Bounded below by how long a row can stay unfolded: the refresh interval (5s)
+ * Bounded below by how long a row can stay unfolded: the refresh interval (2s)
  * plus the second the application caches the published boundary for, so about
- * six. Dropping a sample earlier than that would release the boundary over rows
+ * three. Dropping a sample earlier than that would release the boundary over rows
  * that are still missing from the rollup.
  *
  * Bounded above by cost. This window is also a floor under how close the

@@ -46,11 +46,11 @@ const FLUSH_MAX_ROWS = intFromEnv('FLUSH_MAX_ROWS', 20000);
 const SAFETY_INTERVAL_MS = intFromEnv('FLUSH_INTERVAL_MS', 50);
 
 /**
- * Writes allowed in flight at once. Postgres has a single CPU, so this exists to
- * keep the path pipelined — one batch accumulating while another commits — not
- * to parallelise it.
+ * Writes allowed in flight at once. PostgreSQL has one CPU; one active COPY
+ * lets new requests accumulate into the next group commit instead of making
+ * several backends contend for that core with smaller batches.
  */
-const MAX_CONCURRENT_FLUSHES = intFromEnv('FLUSH_CONCURRENCY', 3);
+const MAX_CONCURRENT_FLUSHES = intFromEnv('FLUSH_CONCURRENCY', 1);
 
 interface Waiter {
   /** Buffer length once this caller's rows were appended. */

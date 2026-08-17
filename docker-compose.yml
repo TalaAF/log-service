@@ -149,7 +149,9 @@ services:
       # a safety net for stranded rows, and FLUSH_MAX_ROWS caps a single COPY.
       FLUSH_INTERVAL_MS: "${FLUSH_INTERVAL_MS:-50}"
       FLUSH_MAX_ROWS: "20000"
-      FLUSH_CONCURRENCY: "3"
+      # One active COPY produced larger group commits and less summed database
+      # execution than three competing COPY backends on the one-CPU server.
+      FLUSH_CONCURRENCY: "1"
       DB_POOL_MAX: "8"
       # Reserved from DB_POOL_MAX for aggregate/state SQL; total read
       # connections remain eight (seven general + one aggregate).

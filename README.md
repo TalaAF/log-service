@@ -66,7 +66,7 @@ GET /logs/aggregate ──▶ admission slot ──▶ route ◀─────�
                      ▼                       ▼                       ▼
               log_rollups            log_rollups + logs             logs
                                                                       ▲
-                                       pg_cron, every 5s ─────────────┘
+                                       pg_cron, every 2s ─────────────┘
                                        folds new ids into log_rollups
 ```
 

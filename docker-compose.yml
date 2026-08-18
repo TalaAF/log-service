@@ -138,7 +138,8 @@ services:
       DATABASE_URL: postgres://loguser:logpass@postgres:5432/logs
       PORT: 8080
       RETENTION_DAYS: ${RETENTION_DAYS:-30}
-      AUTH_ENABLED: "false"
+      AUTH_ENABLED: "${AUTH_ENABLED:-false}"
+      LOADGEN_API_KEY: "${LOADGEN_API_KEY:-}"
       # Cap V8's heap below the cgroup limit so garbage collection reclaims
       # before the kernel OOM-kills the process, and give the young generation
       # room: ingest allocates a large volume of short-lived objects (parsed

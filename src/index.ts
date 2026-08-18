@@ -29,6 +29,19 @@ const app = Fastify({
   bodyLimit: Number(process.env.BODY_LIMIT_BYTES) || 16 * 1024 * 1024,
 });
 
+const authEnabled = ['true', '1'].includes((process.env.AUTH_ENABLED ?? '').toLowerCase());
+const loadgenApiKey = process.env.LOADGEN_API_KEY ?? '';
+
+app.addHook('onRequest', async (request, reply) => {
+  // Health stays public so Compose and the benchmark can establish readiness
+  // before they have an authenticated workload client.
+  if (!authEnabled || request.url === '/health' || request.url.startsWith('/health?')) return;
+
+  if (loadgenApiKey === '' || request.headers.authorization !== `Bearer ${loadgenApiKey}`) {
+    return reply.status(401).send({ error: 'unauthorized' });
+  }
+});
+
 let dbReady = false;
 
 registerHealthRoute(app, () => dbReady);

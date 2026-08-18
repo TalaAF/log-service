@@ -1,10 +1,10 @@
-import { sql } from 'drizzle-orm';
+import { sql, type SQL } from 'drizzle-orm';
 import { from as copyFrom } from 'pg-copy-streams';
 import { pipeline } from 'node:stream/promises';
 import { Readable } from 'node:stream';
 import { db, writePool } from '../db/client.js';
 import { logs, type NewLogEntry } from '../db/schema.js';
-import { attributeCondition } from './attributeFilter.js';
+import { attributeCondition, attributeTokens } from './attributeFilter.js';
 
 const COPY_COLUMNS = '"timestamp", level, service, message, attributes';
 const COPY_SQL = `COPY logs (${COPY_COLUMNS}) FROM STDIN`;
@@ -162,7 +162,181 @@ async function withMarkerSlot<T>(work: () => Promise<T>): Promise<T> {
  * requires a null cursor when no further results exist.
  */
 export async function queryLogs(filters: QueryLogsFilters): Promise<LogPage> {
-  const conditions = [sql`TRUE`];
+  const statement =
+    filters.attributes === undefined
+      ? plainStatement(filters)
+      : attributeStatement(filters, filters.attributes);
+
+  const result =
+    filters.q === undefined
+      ? await db.execute<QueriedLog>(statement)
+      : await withMarkerSlot(() => db.execute<QueriedLog>(statement));
+
+  const hasMore = result.rows.length > filters.limit;
+  return {
+    rows: hasMore ? result.rows.slice(0, filters.limit) : result.rows,
+    hasMore,
+  };
+}
+
+/**
+ * Reshapes an already ordered, already limited page for JSON.
+ *
+ * Ordering and LIMIT happen inside `inner`, on the native bigint/timestamptz
+ * columns, so rows arrive sorted by the composite index rather than by a sort.
+ * This wrapper only converts them (bigint -> text so large ids survive,
+ * timestamp -> ISO 8601) and must not re-sort: ordering by the text forms would
+ * put '9' after '10'.
+ */
+function page(inner: SQL): SQL {
+  return sql`
+    SELECT id::text AS id,
+           to_char("timestamp" AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS timestamp,
+           level,
+           service,
+           message,
+           attributes
+    FROM (${inner}) page
+  `;
+}
+
+/** One indexed scan, for the queries that carry no attribute filter. */
+function plainStatement(filters: QueryLogsFilters): SQL {
+  const conditions = [
+    sql`TRUE`,
+    ...boundConditions(filters, sql.raw('')),
+    ...rowConditions(filters),
+  ];
+
+  return page(sql`
+      SELECT id, "timestamp", level, service, message, attributes
+      FROM logs
+      WHERE ${sql.join(conditions, sql` AND `)}
+      ORDER BY "timestamp" DESC, id DESC
+      LIMIT ${filters.limit + 1}
+  `);
+}
+
+/**
+ * The same page, assembled from the two id ranges an attribute filter has to
+ * cover separately.
+ *
+ * Below the sidecar watermark the tokens are known to exist, so the hashed
+ * prefilter finds candidates without reading raw rows and the join back applies
+ * the exact predicate to each one. At or above the watermark the tokens may not
+ * exist yet, so those rows are read straight from logs with that same exact
+ * predicate. The ranges are disjoint and their union is everything, which is
+ * what makes the answer exact however far behind the indexer is: a row is
+ * queryable when it is committed, not when it is indexed.
+ *
+ * Both branches are limited before the merge. The top n of a union of two
+ * disjoint sets is the top n of the union of their individual top n, so the
+ * indexed side never has to produce more than a page even for an attribute
+ * value that half the table carries.
+ *
+ * The watermark is read inside the statement rather than fetched first. One
+ * snapshot sees the tokens and the watermark move together, so the branches
+ * stay exactly complementary; read in a separate round trip, a watermark that
+ * advanced in between would leave the ids it crossed owned by neither branch.
+ */
+function attributeStatement(
+  filters: QueryLogsFilters,
+  attributes: Record<string, string>
+): SQL {
+  const row = rowConditions(filters);
+
+  // The recheck is a scalar subquery, deliberately, and not a join or an EXISTS.
+  //
+  // Written as a join it is a join, and the planner may implement it as one:
+  // measured on 9M rows it hashed the sidecar and sequentially scanned every
+  // partition of logs to build the other side — 375,000 buffer reads to return
+  // a hundred rows. Written as EXISTS it is no better, because the planner
+  // strips the LIMIT from an EXISTS sublink and pulls it up into the same
+  // semijoin, then unique-ifies logs and drives from there: 341,733 rows
+  // aggregated to answer a page of 101.
+  //
+  // Neither estimate is unreasonable on its own terms — both sides really are
+  // comparable in size, and nothing in a join says only the first page is
+  // wanted. What is wanted is specifically the sidecar as the driving side, so
+  // that the page limit terminates the scan, and a correlated scalar subquery
+  // is the one form that cannot be turned into anything else. It stays a
+  // per-row subplan: one (timestamp, id) index probe per candidate, and the
+  // outer ORDER BY ... LIMIT stops producing candidates once the page is full.
+  //
+  // What the planner still chooses, correctly, is how to find the candidates:
+  // the GIN index when the value is rare, a newest-first walk of the sidecar
+  // when it is common.
+  const recheck = [
+    sql`l."timestamp" = t."timestamp"`,
+    sql`l.id = t.id`,
+    ...row,
+  ];
+
+  const indexed = [
+    sql`t.tokens @> ${attributeTokens(attributes)}`,
+    sql`t.id < (SELECT watermark_id FROM watermark)`,
+    ...boundConditions(filters, sql.raw('t.')),
+    sql`(SELECT 1 FROM logs l WHERE ${sql.join(recheck, sql` AND `)} LIMIT 1) IS NOT NULL`,
+  ];
+
+  // No ORDER BY or LIMIT on this branch. Bounded by the size of the unindexed
+  // tail, it would otherwise invite a plan that walks the timestamp index
+  // newest-first looking for a page's worth of matches — fine when the value is
+  // common, unbounded when it is rare, because nothing tells that scan when it
+  // has passed the last unindexed id. Collecting the tail by id keeps the cost
+  // proportional to the backlog rather than to the history being searched.
+  const unindexed = [
+    sql`l.id >= (SELECT watermark_id FROM watermark)`,
+    ...boundConditions(filters, sql.raw('l.')),
+    ...row,
+  ];
+
+  // Both branches carry keys only. The unindexed one has no page limit to hold
+  // it down, so materialising whole rows would mean holding every matching row
+  // in the backlog — message, attributes and all — to return a hundred of them.
+  // The page is reconstituted at the end from the keys that survived, which is
+  // one index probe per row actually returned.
+  return page(sql`
+      WITH watermark AS MATERIALIZED (
+        SELECT watermark_id FROM attr_index_state WHERE id
+      ),
+      indexed AS MATERIALIZED (
+        SELECT t.id, t."timestamp"
+        FROM log_attr_tokens t
+        WHERE ${sql.join(indexed, sql` AND `)}
+        ORDER BY t."timestamp" DESC, t.id DESC
+        LIMIT ${filters.limit + 1}
+      ),
+      unindexed AS MATERIALIZED (
+        SELECT l.id, l."timestamp"
+        FROM logs l
+        WHERE ${sql.join(unindexed, sql` AND `)}
+      ),
+      merged AS (
+        SELECT id, "timestamp"
+        FROM (SELECT * FROM indexed UNION ALL SELECT * FROM unindexed) sources
+        ORDER BY "timestamp" DESC, id DESC
+        LIMIT ${filters.limit + 1}
+      )
+      SELECT l.id, l."timestamp", l.level, l.service, l.message, l.attributes
+      FROM merged m
+      JOIN logs l ON l."timestamp" = m."timestamp" AND l.id = m.id
+      ORDER BY m."timestamp" DESC, m.id DESC
+  `);
+}
+
+/**
+ * Filters on the log row itself.
+ *
+ * Deliberately unqualified: every column referenced here exists only on `logs`,
+ * so the same fragments are valid in the plain query, in the branch that joins
+ * the sidecar and in the branch that reads raw rows. The exact attribute
+ * predicate is therefore literally the same expression wherever it is applied,
+ * which is what keeps the prefiltered and unfiltered paths from being able to
+ * disagree.
+ */
+function rowConditions(filters: QueryLogsFilters): SQL[] {
+  const conditions: SQL[] = [];
 
   if (filters.service !== undefined) {
     conditions.push(sql`service = ${filters.service}`);
@@ -170,14 +344,6 @@ export async function queryLogs(filters: QueryLogsFilters): Promise<LogPage> {
 
   if (filters.level !== undefined) {
     conditions.push(sql`level = ${filters.level}`);
-  }
-
-  if (filters.since !== undefined) {
-    conditions.push(sql`"timestamp" >= ${filters.since}::timestamptz`);
-  }
-
-  if (filters.until !== undefined) {
-    conditions.push(sql`"timestamp" < ${filters.until}::timestamptz`);
   }
 
   if (filters.attributes !== undefined) {
@@ -188,6 +354,24 @@ export async function queryLogs(filters: QueryLogsFilters): Promise<LogPage> {
 
   if (filters.q !== undefined) {
     conditions.push(sql`message ILIKE ${'%' + escapeLikePattern(filters.q) + '%'}`);
+  }
+
+  return conditions;
+}
+
+/**
+ * Time window and keyset position, qualified by `alias` because the sidecar
+ * carries a timestamp and an id of its own.
+ */
+function boundConditions(filters: QueryLogsFilters, alias: SQL): SQL[] {
+  const conditions: SQL[] = [];
+
+  if (filters.since !== undefined) {
+    conditions.push(sql`${alias}"timestamp" >= ${filters.since}::timestamptz`);
+  }
+
+  if (filters.until !== undefined) {
+    conditions.push(sql`${alias}"timestamp" < ${filters.until}::timestamptz`);
   }
 
   if (filters.cursor !== undefined) {
@@ -207,43 +391,11 @@ export async function queryLogs(filters: QueryLogsFilters): Promise<LogPage> {
     // drive partition pruning, and without it every page opens all 11
     // partitions instead of the 7 that can hold matching rows.
     conditions.push(
-      sql`"timestamp" <= ${timestamp}::timestamptz AND ("timestamp", id) < (${timestamp}::timestamptz, ${id}::bigint)`
+      sql`${alias}"timestamp" <= ${timestamp}::timestamptz AND (${alias}"timestamp", ${alias}id) < (${timestamp}::timestamptz, ${id}::bigint)`
     );
   }
 
-  const whereClause = sql.join(conditions, sql` AND `);
-
-  // Ordering and LIMIT happen in the inner query, on the native bigint/timestamptz
-  // columns, so the (timestamp DESC, id DESC) index supplies rows already sorted.
-  // The outer SELECT only reshapes the page for JSON (bigint -> text so large ids
-  // survive, timestamp -> ISO 8601) and must not re-sort: ordering by the text
-  // forms would put '9' after '10'.
-  const statement = sql`
-    SELECT id::text AS id,
-           to_char("timestamp" AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS timestamp,
-           level,
-           service,
-           message,
-           attributes
-    FROM (
-      SELECT id, "timestamp", level, service, message, attributes
-      FROM logs
-      WHERE ${whereClause}
-      ORDER BY "timestamp" DESC, id DESC
-      LIMIT ${filters.limit + 1}
-    ) page
-  `;
-
-  const result =
-    filters.q === undefined
-      ? await db.execute<QueriedLog>(statement)
-      : await withMarkerSlot(() => db.execute<QueriedLog>(statement));
-
-  const hasMore = result.rows.length > filters.limit;
-  return {
-    rows: hasMore ? result.rows.slice(0, filters.limit) : result.rows,
-    hasMore,
-  };
+  return conditions;
 }
 
 /** Neutralises LIKE wildcards so `q` stays a literal substring match. */

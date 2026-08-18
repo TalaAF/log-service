@@ -167,6 +167,20 @@ services:
       ROLLUP_LAG_SECONDS: "${ROLLUP_LAG_SECONDS:-10}"
       INGEST_FLOOR_WINDOW_SECONDS: "${INGEST_FLOOR_WINDOW_SECONDS:-12}"
       ROLLUP_RETENTION_DAYS: "${ROLLUP_RETENTION_DAYS:-${RETENTION_DAYS:-30}}"
+      # Attribute indexer. The GIN that used to make `attr.<key>=<value>`
+      # answerable was maintained inside the COPY transaction and was the most
+      # expensive thing ingest did; it now lives in a derived sidecar filled by
+      # a background job. These are the throttle: how long a cycle may keep
+      # indexing while the database is quiet, and how many other executing
+      # backends make it stop and hand the core back. Every attribute query is
+      # exact whatever the indexer is doing — ids it has not reached are read
+      # straight from the raw table — so falling behind costs query work,
+      # never correctness.
+      ATTR_INDEX_ENABLED: "${ATTR_INDEX_ENABLED:-true}"
+      ATTR_INDEX_BUDGET_MS: "${ATTR_INDEX_BUDGET_MS:-300}"
+      ATTR_INDEX_BUSY_BACKENDS: "${ATTR_INDEX_BUSY_BACKENDS:-1}"
+      ATTR_INDEX_TARGET_BATCH_MS: "${ATTR_INDEX_TARGET_BATCH_MS:-25}"
+      ATTR_INDEX_MAX_BATCH_MS: "${ATTR_INDEX_MAX_BATCH_MS:-60}"
       # Expensive aggregates allowed to execute at once. Postgres has one core,
       # so this is not a parallelism setting — it is the cap that stops
       # analytical reads taking the core away from ingestion and from GET /logs.

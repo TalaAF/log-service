@@ -10,10 +10,10 @@ export const logs = pgTable(
     message: text('message').notNull(),
     attributes: jsonb('attributes').notNull().default({}),
   },
-  (table) => [
-    index('idx_logs_timestamp_id').on(table.timestamp.desc(), table.id.desc()),
-    index('idx_logs_attributes_gin').using('gin', table.attributes),
-  ]
+  // Attribute lookups are served by the derived sidecar in
+  // 0010_attr_sidecar.sql, not by an index on this table: maintaining a GIN
+  // inside the COPY transaction was the single most expensive thing ingest did.
+  (table) => [index('idx_logs_timestamp_id').on(table.timestamp.desc(), table.id.desc())]
 );
 
 export type LogEntry = typeof logs.$inferSelect;

@@ -66,6 +66,7 @@ export async function runMigrations(pool: Pool, log: (msg: string) => void): Pro
 
     await syncRetentionConfig(pool, log);
     await syncRollupConfig(pool, log);
+    await syncAttrIndexConfig(pool, log);
     await ensurePartitions(pool, log);
   } finally {
     await pool.query('SELECT pg_advisory_unlock($1)', [MIGRATION_LOCK_ID]);
@@ -112,6 +113,53 @@ export async function syncRollupConfig(pool: Pool, log: (msg: string) => void): 
     [lagSeconds, maxFoldRows, rollupDays]
   );
   log(`rollups: lag ${lagSeconds}s, retention ${rollupDays} day(s), fold cap ${maxFoldRows} rows`);
+}
+
+/**
+ * Writes the attribute-indexer knobs into attr_index_config, on the same
+ * every-boot basis as the others.
+ *
+ * These are throttle settings, not correctness settings. The indexer is a
+ * background consumer of a single CPU that ingestion and queries are also
+ * using, and every attribute query stays exact whether it runs, falls behind or
+ * never runs at all — the raw fallback covers whatever is not indexed yet. So
+ * they are deliberately ungenerous: ATTR_INDEX_BUDGET_MS is how long a cycle
+ * may keep working while the database is quiet, and ATTR_INDEX_BUSY_BACKENDS
+ * how many other executing backends make it stop after a single small batch
+ * and hand the core back.
+ *
+ * ATTR_INDEX_ENABLED=false turns it off entirely, which leaves every attribute
+ * query on the fallback path. That is a supported state, not a broken one, and
+ * it is the switch to reach for if the indexer is ever suspected of costing
+ * more than it returns.
+ */
+export async function syncAttrIndexConfig(pool: Pool, log: (msg: string) => void): Promise<void> {
+  const enabled = (process.env.ATTR_INDEX_ENABLED ?? 'true').toLowerCase() !== 'false';
+  const targetBatchMs = positiveIntFromEnv('ATTR_INDEX_TARGET_BATCH_MS', 25, false);
+  const maxBatchMs = positiveIntFromEnv('ATTR_INDEX_MAX_BATCH_MS', 60, false);
+  const budgetMs = positiveIntFromEnv('ATTR_INDEX_BUDGET_MS', 300, true);
+  const minBatchRows = positiveIntFromEnv('ATTR_INDEX_MIN_BATCH_ROWS', 250, false);
+  const maxBatchRows = positiveIntFromEnv('ATTR_INDEX_MAX_BATCH_ROWS', 25_000, false);
+  const busyBackends = positiveIntFromEnv('ATTR_INDEX_BUSY_BACKENDS', 1, false);
+
+  await pool.query(
+    `INSERT INTO attr_index_config (id, enabled, target_batch_ms, max_batch_ms,
+                                    budget_ms, min_batch_rows, max_batch_rows, busy_backends)
+     VALUES (TRUE, $1, $2, $3, $4, $5, $6, $7)
+     ON CONFLICT (id) DO UPDATE
+       SET enabled         = EXCLUDED.enabled,
+           target_batch_ms = EXCLUDED.target_batch_ms,
+           max_batch_ms    = EXCLUDED.max_batch_ms,
+           budget_ms       = EXCLUDED.budget_ms,
+           min_batch_rows  = EXCLUDED.min_batch_rows,
+           max_batch_rows  = EXCLUDED.max_batch_rows,
+           busy_backends   = EXCLUDED.busy_backends`,
+    [enabled, targetBatchMs, maxBatchMs, budgetMs, minBatchRows, maxBatchRows, busyBackends]
+  );
+  log(
+    `attribute index: ${enabled ? 'on' : 'off'}, batch target ${targetBatchMs}ms (max ${maxBatchMs}ms), ` +
+      `catch-up budget ${budgetMs}ms, yields above ${busyBackends} active backend(s)`
+  );
 }
 
 /** Reads a positive integer setting, or zero-or-more when `allowZero`. */

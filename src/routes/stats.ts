@@ -5,6 +5,7 @@ import { snapshot } from '../observability/metrics.js';
 import { gateStats } from '../observability/aggregateGate.js';
 import { bufferStats } from '../ingest/writeBuffer.js';
 import { getRollupState } from '../repositories/rollupState.js';
+import { getAttrIndexSnapshot } from '../repositories/attrIndexState.js';
 import { aggregateTraceSnapshot } from '../observability/aggregateTrace.js';
 
 /**
@@ -29,6 +30,13 @@ interface DbStatsRow extends Record<string, unknown> {
 
 async function handleGetStats(request: FastifyRequest, reply: FastifyReply) {
   const state = await getRollupState();
+
+  let attrIndex = null;
+  try {
+    attrIndex = await getAttrIndexSnapshot();
+  } catch {
+    // Diagnostics must never be the reason a request fails.
+  }
 
   let dbStats: DbStatsRow | undefined;
   try {
@@ -66,6 +74,7 @@ async function handleGetStats(request: FastifyRequest, reply: FastifyReply) {
       skipped: state.skipped,
       catching_up: state.behind,
     },
+    attr_index: attrIndex,
     pools: {
       read: { total: pool.totalCount, idle: pool.idleCount, waiting: pool.waitingCount },
       aggregate: {

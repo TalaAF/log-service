@@ -111,6 +111,43 @@ export interface LogPage {
   hasMore: boolean;
 }
 
+const MARKER_QUERY_CONCURRENCY = 1;
+let activeMarkerQueries = 0;
+
+// A marker lookup walks every service/time candidate to prove there are no
+// further substring matches. On the one-CPU database, allowing all seven read
+// clients to do that together increases total DB time and delays every other
+// workload. One slot can serve about 58 queries/s at the measured 17.15 ms
+// mean, above the benchmark's 34-query/s peak, while the rest queue cheaply in
+// the application.
+const markerQueue: Array<() => void> = [];
+
+async function acquireMarkerSlot(): Promise<void> {
+  if (activeMarkerQueries < MARKER_QUERY_CONCURRENCY) {
+    activeMarkerQueries++;
+    return;
+  }
+
+  // releaseMarkerSlot transfers the active slot directly to this waiter, so
+  // no newly arriving request can jump the queue between release and resume.
+  await new Promise<void>((resolve) => markerQueue.push(resolve));
+}
+
+function releaseMarkerSlot(): void {
+  const next = markerQueue.shift();
+  if (next === undefined) activeMarkerQueries--;
+  else next();
+}
+
+async function withMarkerSlot<T>(work: () => Promise<T>): Promise<T> {
+  await acquireMarkerSlot();
+  try {
+    return await work();
+  } finally {
+    releaseMarkerSlot();
+  }
+}
+
 /**
  * Fetches one page of logs ordered by (timestamp DESC, id DESC).
  *
@@ -181,7 +218,7 @@ export async function queryLogs(filters: QueryLogsFilters): Promise<LogPage> {
   // The outer SELECT only reshapes the page for JSON (bigint -> text so large ids
   // survive, timestamp -> ISO 8601) and must not re-sort: ordering by the text
   // forms would put '9' after '10'.
-  const result = await db.execute<QueriedLog>(sql`
+  const statement = sql`
     SELECT id::text AS id,
            to_char("timestamp" AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS timestamp,
            level,
@@ -195,7 +232,12 @@ export async function queryLogs(filters: QueryLogsFilters): Promise<LogPage> {
       ORDER BY "timestamp" DESC, id DESC
       LIMIT ${filters.limit + 1}
     ) page
-  `);
+  `;
+
+  const result =
+    filters.q === undefined
+      ? await db.execute<QueriedLog>(statement)
+      : await withMarkerSlot(() => db.execute<QueriedLog>(statement));
 
   const hasMore = result.rows.length > filters.limit;
   return {

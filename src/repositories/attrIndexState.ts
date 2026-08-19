@@ -57,6 +57,7 @@ interface StateRow extends Record<string, unknown> {
 /** Upper edge of each histogram slot, in milliseconds; the last is unbounded. */
 const HISTOGRAM_EDGES = [5, 10, 20, 40, 80, 160, 320, Infinity];
 
+
 function percentile(hist: number[], fraction: number): number {
   const total = hist.reduce((sum, n) => sum + n, 0);
   if (total === 0) return 0;

@@ -60,6 +60,28 @@ for (const p of [pool, aggregatePool, writePool]) {
   p.on('error', (err) => {
     console.error('[pg] idle client error:', err.message);
   });
+
+  // The pool handler above only covers a client while it is *idle*. pg-pool
+  // attaches its own 'error' listener when a connection goes into the idle set
+  // and removes it again for the duration of every checkout, so a connection
+  // that drops while a client is held -- the whole of a COPY in copyLogs, and
+  // every aggregate/state query -- emits 'error' with no listener at all, which
+  // Node turns into an uncaught exception and the process exits 1.
+  //
+  // Awaiting the query is not protection: the in-flight query rejects first and
+  // is handled normally (the request still becomes a 5xx), and the client then
+  // emits a *separate* 'error' event that no try/catch is in a position to see.
+  //
+  // 'connect' fires once per physical connection, and pg-pool only ever removes
+  // its own listener by reference, so this one stays attached for the client's
+  // whole life and covers both states. Recovery is unchanged: pg-pool already
+  // evicts a client whose connection broke when it is released, and the pool
+  // opens a fresh one on the next checkout.
+  p.on('connect', (client) => {
+    client.on('error', (err) => {
+      console.error('[pg] client error:', err.message);
+    });
+  });
 }
 
 export const db = drizzle(pool, { schema });

@@ -375,6 +375,40 @@ async function watermarkAggregate(
     ];
     if (range.minId !== undefined) {
       conditions.push(sql`id >= (SELECT watermark_id FROM watermark)`);
+
+      // Redundant lower bound, present only so the planner can see a constant.
+      //
+      // The line above is the ownership invariant and stays exactly as it was:
+      // the watermark is re-read inside this statement's snapshot so folded and
+      // unfolded IDs are disjoint even while a refresh commits. But it reaches
+      // the planner as an InitPlan parameter of unknown value, so `id >= ?` gets
+      // a default selectivity guess over the whole requested window. The planner
+      // then decides the timestamp index is the cheaper driver and walks every
+      // index entry in the window — measured at 15.8s and ~40k buffers to return
+      // a 16k-row tail, with cost scaling by window size rather than tail size.
+      //
+      // With a constant here instead, the same query plans as a BRIN scan on id
+      // (37 buffers, 1.2ms for the index step) because `id` is physically
+      // correlated on an append-only table.
+      //
+      // Safe because it can only ever be weaker than the invariant above.
+      // `range.minId` is the watermark this request already read through
+      // getRollupState, and runtime refreshes only advance it
+      // (h_new := LEAST(seq_last + 1, h_old + max_fold_rows) >= h_old), so a
+      // cached copy is always <= the value the subquery returns. `id >= cached`
+      // is therefore implied by `id >= current` and cannot exclude a visible
+      // row — including a backdated one, whose ownership is decided by ID and
+      // not by its timestamp. If the cache were ever ahead of the database this
+      // would start excluding rows, which is why it is derived from the state
+      // this statement is already planned against rather than from a separate
+      // read.
+      //
+      // Inlined rather than bound so it is a true constant at plan time; the
+      // digit test is what makes that safe, and the value's only source is a
+      // bigint column read back as text.
+      if (/^\d+$/.test(range.minId)) {
+        conditions.push(sql`id >= ${sql.raw(range.minId)}`);
+      }
     }
     return sql`(${sql.join(conditions, sql` AND `)})`;
   });

@@ -176,7 +176,18 @@ services:
       # exact whatever the indexer is doing — ids it has not reached are read
       # straight from the raw table — so falling behind costs query work,
       # never correctness.
-      ATTR_INDEX_ENABLED: "${ATTR_INDEX_ENABLED:-true}"
+      # Background attribute indexing is off by default. On a CPU-constrained
+      # database it consumes substantial foreground capacity, and once ingest
+      # outpaces indexing the backlog grows without ever catching up, so that
+      # capacity buys little: `attr.<key>=<value>` still reads the unindexed
+      # tail from the raw table either way. The raw fallback is exact, so API
+      # semantics are identical with it on or off (see attributeStatement in
+      # logsRepository) -- only the speed of attribute lookups differs, and on a
+      # large table an unindexed attribute scan is slow.
+      #
+      # Set ATTR_INDEX_ENABLED=true for attribute-query-heavy deployments, where
+      # a database with capacity to spare can keep the index current.
+      ATTR_INDEX_ENABLED: "${ATTR_INDEX_ENABLED:-false}"
       ATTR_INDEX_BUDGET_MS: "${ATTR_INDEX_BUDGET_MS:-300}"
       ATTR_INDEX_BUSY_BACKENDS: "${ATTR_INDEX_BUSY_BACKENDS:-1}"
       ATTR_INDEX_TARGET_BATCH_MS: "${ATTR_INDEX_TARGET_BATCH_MS:-25}"

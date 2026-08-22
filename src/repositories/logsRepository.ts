@@ -43,13 +43,37 @@ function copyEscape(value: string): string {
 export async function copyLogs(entries: NewLogEntry[]): Promise<void> {
   if (entries.length === 0) return;
 
+  // Rows of one service are written next to each other within the batch.
+  //
+  // A group commit mixes whatever arrived from every client, so consecutive
+  // rows in the stream are usually different services and land on consecutive
+  // heap pages in that mixed order. A query filtered by service then walks
+  // (service, timestamp, id) and finds its matches one per page, paying a heap
+  // access for each. Grouping the batch first puts a service's rows on a
+  // contiguous run of pages instead, so one page can answer several matches.
+  //
+  // Only the order inside a single COPY changes. The batch still carries
+  // exactly the same rows, so the flush's waiters — resolved by how many rows
+  // the write covered, not by position — are unaffected, and ids are still
+  // handed out by the sequence in stream order, which keeps id monotonic with
+  // physical position and leaves BRIN(id) as correlated as before. Which row
+  // receives which id inside the batch does change; nothing depends on that
+  // (ordering is (timestamp, id), ownership is by id, and the batch commits
+  // atomically so its ids become visible together).
+  //
+  // The sort is stable, so rows of the same service keep their arrival order.
+  const ordered =
+    entries.length > 1
+      ? [...entries].sort((a, b) => (a.service < b.service ? -1 : a.service > b.service ? 1 : 0))
+      : entries;
+
   const client = await writePool.connect();
   try {
     // Built as one string for the whole batch: thousands of small stream writes
     // cost far more in the app container, which has half a CPU, than a single
     // large buffer does.
     const parts: string[] = [];
-    for (const entry of entries) {
+    for (const entry of ordered) {
       parts.push(
         copyEscape(entry.timestamp as string),
         '\t',
